@@ -58,6 +58,10 @@ func main() {
 			// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
 			if key, werr := WriteDefault(*cfgPath); werr == nil {
 				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", *cfgPath, key)
+				if legacyConfigExists() {
+					log.Printf("WARN: 检测到旧路径 %s 仍有配置但未被读取（升级未迁移）：见 README「升级说明」；"+
+						"客户端需要改用刚生成的新 api_key", legacyConfigPath())
+				}
 				cfg, err = Load(*cfgPath)
 			}
 			if err != nil {
@@ -69,6 +73,18 @@ func main() {
 		if err != nil {
 			log.Fatalf("load config: %v", err)
 		}
+	}
+
+	// 配置目录/挂载形态预检：把"点了保存才发现"提前到启动。只告警，不阻断启动——
+	// 存量旧布局（单文件挂载）必须能起来，才谈得上按 README 升级说明迁移。
+	if warn := configPrecheck(*cfgPath); warn != "" {
+		log.Printf("WARN: %s", warn)
+	}
+	// 空 api_key = 不鉴权（config.go 既有语义：httpauth.VerifyBearer 对空 key 直接放行）。
+	// 容器里 7863 默认对外映射，"配置不存在 + 目录不可写 → 回落 Load("")" 这条路径会静默
+	// 变成无鉴权（entrypoint 已在启动期 WARN 一次，这里补程序侧的权威告警）。
+	if cfg.APIKey == "" {
+		log.Printf("WARN: 未设置 api_key（空 = 不鉴权）：7863 对外映射时任何客户端都可调用。见 README「升级说明」")
 	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
@@ -353,12 +369,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return nil, fmt.Errorf("write config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("replace config: %w", err)
+	if err := writeConfigAtomic(path, out); err != nil {
+		return nil, err
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。

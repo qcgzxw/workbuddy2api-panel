@@ -231,12 +231,13 @@ func Load(path string) (*Config, error) {
 		// 直接 ReadFile 会报 "Incorrect function" 之类晦涩错误，这里给出可操作提示。
 		if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
 			return nil, fmt.Errorf("config %s 是目录而非文件——"+
-				"Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。"+
-				"请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）", path)
+				"（Docker 部署：配置应放在目录挂载内，如 ./data/config.json；"+
+				"若你用的是单文件挂载，宿主机缺少该文件时 Docker 会把它建成同名目录）"+
+				"请删除该目录（程序会自动生成配置）", path)
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read config: %w", err)
+			return nil, readConfigError(path, err)
 		}
 		if _, err := ParseConfigInto(raw, c); err != nil {
 			return nil, err

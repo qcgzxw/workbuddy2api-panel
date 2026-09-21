@@ -42,3 +42,11 @@ func isSeparateMount(dir, path string) bool {
 	}
 	return tsys.Dev != dsys.Dev
 }
+
+// permHintSuffix 权限类错误的可操作指引后缀（Unix/Docker 语境）。非 Unix 平台无 uid/属主
+// 语义，返回空串（裸错误本身已自解释，如 Windows 的 "Access is denied"）。
+func permHintSuffix(dir string) string {
+	return fmt.Sprintf("当前 uid=%d，目录属主 %s。默认部署会按挂载目录属主自动适配身份；"+
+		"若在 compose 里固定了 user:，请改设 PUID/PGID 或让目录属主与之匹配。见 README「Docker 权限排障」",
+		os.Getuid(), dirOwnerString(dir))
+}

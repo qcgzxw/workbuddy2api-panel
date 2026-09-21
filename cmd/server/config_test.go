@@ -715,7 +715,7 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 	if !strings.Contains(msg, "是目录") {
 		t.Errorf("error should explain it is a directory: %v", err)
 	}
-	if !strings.Contains(msg, "config.example.json") {
-		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
+	if !strings.Contains(msg, "目录挂载") || !strings.Contains(msg, "程序会自动生成配置") {
+		t.Errorf("error should point at the dir-mount layout + auto-generate: %v", err)
 	}
 }

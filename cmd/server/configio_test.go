@@ -123,6 +123,10 @@ func TestConfigPrecheckSilentOnNormalFile(t *testing.T) {
 	if warn := configPrecheck(path); warn != "" {
 		t.Errorf("正常布局不该有 WARN: %s", warn)
 	}
+	// 探针必须被清掉。
+	if _, err := os.Stat(filepath.Join(dir, ".wb2a-writecheck")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("探针未清理, stat err=%v", err)
+	}
 }
 
 // TestIsSeparateMountIgnoresSymlink 判定必须用 Lstat：跟随符号链接会把同目录的链接
@@ -158,5 +162,62 @@ func TestWriteConfigAtomicRenameFailureCleansTmp(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".tmp"); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("rename 失败后 tmp 必须被清理, stat err=%v", err)
+	}
+}
+
+// TestLegacyConfigExistsOnlyForRegularFile 旧路径提示只在"确实有一份常规文件"时触发；
+// Docker 造出的同名目录不算配置，不该误报。
+func TestLegacyConfigExistsOnlyForRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+
+	if legacyConfigExists() {
+		t.Error("空目录不该判定为存在旧配置")
+	}
+	if err := os.Mkdir(legacyConfigPath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if legacyConfigExists() {
+		t.Error("目录形态不该算旧配置")
+	}
+	if err := os.Remove(legacyConfigPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyConfigPath(), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !legacyConfigExists() {
+		t.Error("常规文件应判定为存在旧配置")
+	}
+}
+
+// TestReadConfigErrorEACCESIsActionable 读路径的权限分支——三分流里唯一无覆盖的文案路径，
+// 接线后若有人改坏它（重排参数、漏 permHintSuffix）不会有测试变红。
+func TestReadConfigErrorEACCESIsActionable(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root 无视文件权限")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	_, err := Load(path)
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("err=%v 必须包装 fs.ErrPermission", err)
+	}
+	if !strings.Contains(err.Error(), "Docker 权限排障") {
+		t.Errorf("EACCES 文案缺少指引: %v", err)
 	}
 }

@@ -35,10 +35,10 @@ func writeConfigAtomic(path string, out []byte) error {
 func configWriteError(tmp string, err error) error {
 	if errors.Is(err, fs.ErrPermission) {
 		dir := filepath.Dir(tmp)
-		return fmt.Errorf("write config: %w\n（%s 不可写：当前 uid=%d，目录属主 %s。"+
-			"默认部署会按挂载目录属主自动适配身份；若在 compose 里固定了 user:，"+
-			"请改设 PUID/PGID 或让目录属主与之匹配。见 README「Docker 权限排障」）",
-			err, dir, os.Getuid(), dirOwnerString(dir))
+		if s := permHintSuffix(dir); s != "" {
+			return fmt.Errorf("write config: %w\n（%s 不可写：%s）", err, dir, s)
+		}
+		return fmt.Errorf("write config: %w（%s 不可写）", err, dir)
 	}
 	return fmt.Errorf("write config: %w", err)
 }
@@ -56,10 +56,11 @@ func configReplaceError(path string, err error) error {
 // permission denied + 进程退出重启，比面板保存更早出现。必须保留 %w 包装。
 func readConfigError(path string, err error) error {
 	if errors.Is(err, fs.ErrPermission) {
-		return fmt.Errorf("read config: %w\n（%s 不可读：当前 uid=%d，目录属主 %s。"+
-			"容器内身份由 entrypoint.sh 解析；若在 compose 里固定了 user:，"+
-			"请改设 PUID/PGID 或让目录属主与之匹配。见 README「Docker 权限排障」）",
-			err, path, os.Getuid(), dirOwnerString(filepath.Dir(path)))
+		dir := filepath.Dir(path)
+		if s := permHintSuffix(dir); s != "" {
+			return fmt.Errorf("read config: %w\n（%s 不可读：%s）", err, path, s)
+		}
+		return fmt.Errorf("read config: %w（%s 不可读）", err, path)
 	}
 	return fmt.Errorf("read config: %w", err)
 }
@@ -73,8 +74,10 @@ func configPrecheck(path string) string {
 	// 若配置落在未忽略的目录，它会短暂出现在 git status 里）。
 	probe := filepath.Join(dir, ".wb2a-writecheck")
 	if err := os.WriteFile(probe, nil, 0o600); err != nil {
-		return fmt.Sprintf("配置目录 %s 不可写（当前 uid=%d，目录属主 %s）：面板保存会失败，见 README「Docker 权限排障」",
-			dir, os.Getuid(), dirOwnerString(dir))
+		if s := permHintSuffix(dir); s != "" {
+			return fmt.Sprintf("配置目录 %s 不可写：%s", dir, s)
+		}
+		return fmt.Sprintf("配置目录 %s 不可写：面板保存会失败；请检查目录权限", dir)
 	}
 	_ = os.Remove(probe)
 	// ② 挂载形态：目标若是被单独挂载的文件，tmp+rename 必然 EBUSY。
@@ -83,4 +86,15 @@ func configPrecheck(path string) string {
 			"请把配置改到目录挂载下（如 ./data/config.json），见 README「升级说明」", path)
 	}
 	return ""
+}
+
+// legacyConfigPath 旧版布局的配置路径（历史约定：工作目录下的 config.json，
+// 容器内即 /app/config.json 的单文件挂载点）。
+func legacyConfigPath() string { return "config.json" }
+
+// legacyConfigExists 报告旧路径是否仍有一份"未被读取"的配置文件——升级未迁移的现场。
+// 只看常规文件：目录形态是 Docker 在宿主文件缺失时建出来的，不算配置。
+func legacyConfigExists() bool {
+	st, err := os.Stat(legacyConfigPath())
+	return err == nil && !st.IsDir()
 }

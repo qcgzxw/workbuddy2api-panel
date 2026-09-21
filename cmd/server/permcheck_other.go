@@ -10,3 +10,6 @@ func dirOwnerString(string) string { return "?" }
 
 // isSeparateMount Windows 不做该判定。
 func isSeparateMount(string, string) bool { return false }
+
+// permHintSuffix 非 Unix 无 uid/属主语义，不给指引（避免输出 "uid=-1" 这类无意义文案）。
+func permHintSuffix(string) string { return "" }
