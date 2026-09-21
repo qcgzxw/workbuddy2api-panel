@@ -768,7 +768,7 @@ docker compose up -d --force-recreate
 sudo chown -R 10001:10001 ./auths ./data
 ```
 
-**② `replace config: … resource busy`（EBUSY）**——`config.json` 还是"单文件挂载"（`./config.json:/app/config.json`，本版之前的布局），`rename` 无法覆盖挂载点。按「升级说明」（见「部署运维」）把配置迁到 `./data/config.json` 即可。
+**② `replace config: … resource busy`（EBUSY）**——配置仍挂在单文件挂载 `./config.json:/app/config.json`（旧布局；本版已改为目录挂载 `./data/config.json`），`rename(2)` 无法覆盖挂载点。按「升级说明」（见「部署运维」）迁到 `./data/config.json` 即可。
 
 **③ `read config: … permission denied` 且容器反复重启**——配置文件以 `0600` 写在别人名下，当前身份读不到。同 ① 对齐身份即可。
 
