@@ -167,13 +167,20 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     # API_KEY 从配置读取，按新→旧顺序取第一个存在的：WB2A_CONFIG → data/config.json（新布局，
     # 容器内即 /app/data/config.json）→ config.json（旧布局，迁移窗口期仍可命中）。
     # 三条都是相对 CWD，宿主（仓库根）与容器内（/app）两种跑法都成立。
-    # 都读不到时 fallback 仅为占位，不会通过鉴权。
+    # 都读不到时 API_KEY 为空，下面 fallback 仅为占位，不会通过鉴权。
+    # 注意本脚本是 set -euo pipefail：候选文件若解析失败必须 continue，否则一次 json 报错
+    # 会让脚本在半路（auth 已落盘、容器已重启之后）直接中止、连完成提示都不打。
     API_KEY=$(python3 -c '
 import json, os
 for c in [os.environ.get("WB2A_CONFIG") or "", "data/config.json", "config.json"]:
-    if c and os.path.exists(c):
-        print(json.load(open(c)).get("api_key", ""))
-        break
+    if not c or not os.path.exists(c):
+        continue
+    try:
+        v = json.load(open(c)).get("api_key", "")
+    except Exception:
+        continue          # 候选损坏（半截写入/手工改坏）就跳过，别让它 abort 整个脚本
+    print(v)
+    break
 ' 2>/dev/null)
     COUNT=$(curl -s http://127.0.0.1:7863/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
     echo "服务已重启，当前账号数: $COUNT"
