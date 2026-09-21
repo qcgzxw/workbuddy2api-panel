@@ -47,7 +47,10 @@ function toast(msg, cls) {
   el.className = 'tst ' + (cls || '');
   el.textContent = msg;
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), 3600);
+  // 错误文案常带多行可操作指引（如"请把配置放进目录挂载"），3.6s 读不完；
+  // 点击可立即关闭，所以延长不会堆积。
+  const t = setTimeout(() => el.remove(), cls === 'err' ? 12000 : 3600);
+  el.addEventListener('click', () => { clearTimeout(t); el.remove(); });
 }
 // esc 文本/属性双安全转义。不能只用 div.innerHTML（它转义 <>& 但不转义引号），
 // 否则字符串拼进 HTML 属性（如 title="uid: ..."）时引号可闭合属性并注入事件处理器。

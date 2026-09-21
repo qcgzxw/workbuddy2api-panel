@@ -325,10 +325,9 @@ func (a *Auth) SaveAtomic() error {
 		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
 		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
 		if errors.Is(err, fs.ErrPermission) {
-			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
-				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
-				"2) sudo chown -R 10001:10001 ./auths ./data ./config.json；" +
-				"3) compose 设 user: \"0:0\" 以 root 运行）"
+			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。默认部署会按挂载目录属主" +
+				"自动适配身份（见 entrypoint.sh）；若在 compose 里固定了 user:，请改设 PUID/PGID，" +
+				"或把宿主目录属主改成与容器身份一致。见 README「Docker 权限排障」）"
 		}
 		return errors.New(msg)
 	}

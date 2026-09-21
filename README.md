@@ -134,7 +134,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 |---|---|
 | **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、单号运维、批量任务、日志查看、明暗主题 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
-| **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
+| **在线配置编辑（热生效）** | 面板直接改 `./data/config.json`（目录挂载，`tmp+rename` 原子替换）：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
@@ -209,9 +209,9 @@ flowchart LR
 git clone https://github.com/linguo2625469/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
-# 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
-cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+# 2. 建数据目录（以你自己的身份创建：容器身份默认就按这里的属主解析，
+#    权限零配置；配置由程序首次启动时自动生成在 ./data/config.json）
+mkdir -p auths data
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
@@ -220,6 +220,8 @@ docker compose up -d --build
 curl -s http://localhost:7863/healthz
 # {"healthy":0,"total":0,"service":"workbuddy2api"}
 ```
+
+首次启动会把随机生成的 `api_key` 打进日志：`docker compose logs | grep api_key`——面板与 API 都用它。
 
 启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录（见下节）。
 
@@ -615,11 +617,49 @@ http://127.0.0.1:7863/panel/
 多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：
 
 - **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
-- 以 `app` 用户（uid 10001）运行，`app/auths` 与 `app/data` 预建
-- 镜像内默认落 `config.example.json` 作为空配置（不含密钥），生产用挂载卷覆盖 `/app/config.json`
+- **身份自适应**：容器以 root 启动，`entrypoint.sh` 解析目标身份后 `su-exec` 降权 —— **主进程始终非 root**（`docker exec` 与 `HEALTHCHECK` 仍以容器默认身份执行，需要非 root 时加 `-u`）。默认无需指定 uid，root / 非 root 都能跑
+- `app/auths` 与 `app/data` 预建；镜像**不含任何配置文件**，首次启动自动生成随机 `api_key` 到 `/app/data/config.json`（日志打印一次）
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）
 
-账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。
+身份解析顺序（`PUID`/`PGID` 是**容器内**环境变量，compose 里靠 `environment` 透传；`.env` 里的同名变量即由此生效）：
+
+| 输入 | 容器身份 |
+|---|---|
+| 未设 `PUID`/`PGID`，`./data` 属主非 root | 该目录的 `uid:gid`（零配置默认路径） |
+| 未设，`./data` 由 Docker 以 root 创建 | `10001:10001`，并把 `./auths`、`./data` chown 给它 |
+| 只设 `PUID`（或只设 `PGID`） | `PUID` 决定 uid，gid 跟随；只设 `PGID` 时 uid 取目录属主 |
+| 设了 `PUID`/`PGID` | 该值；目录属主不匹配时 `chown -R` 对齐 |
+| `PUID=0` | 保持 root 运行（显式逃生门） |
+| compose 里固定了**非 root** `user:` | 容器非 root 启动 → 完全不 chown，目录不可写时只打 WARN |
+
+账号 / 配置 / 数据都通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`（配置即 `./data/config.json`）。
+
+> **配置为什么在 `data/` 里？** 面板保存用 `tmp + rename` 原子替换，而 `rename(2)` 不允许覆盖挂载点——单文件挂载 `./config.json` 会让保存恒失败（`EBUSY`）；同时临时文件会落进镜像层目录 `/app`，非 10001 身份又撞 `EACCES`。放进目录挂载后，原子语义保留、可写性也天然跟着宿主属主走。
+
+> ⚠️ **全新部署若没先 `mkdir -p auths data`**（见「快速开始」）：目录会由 Docker 以 root 创建，身份于是回落到 `10001` 并把目录 chown 过去 —— 配置以 `0600` 写成后**宿主侧读不到 `api_key`**（宿主跑 `login.sh` 会拿到空 key，得到 401）。先 `mkdir -p auths data`（一条命令、无需 sudo）或在 `.env` 里显式设 `PUID=$(id -u)` 都能避免。
+
+### 升级说明（配置从 `./config.json` 迁到 `./data/config.json`）
+
+本版把配置从"单文件挂载 `/app/config.json`"改为"目录挂载内的 `/app/data/config.json`"（原因见上节）。存量部署二选一：
+
+```bash
+# 方式一：让容器自己迁移（推荐，不需要 sudo，root 属主的旧文件也能读）
+#   1) 取消 docker-compose.yml 里这两行的注释：
+#        # - ./config.json:/app/config.json:ro
+#   2) docker compose up -d    → 启动日志出现「已把旧 ./config.json 迁移到 ./data/config.json」
+#   3) 确认 ./data/config.json 里的 api_key 正确后，删除宿主 ./config.json 与那两行挂载，再 up -d 一次
+
+# 方式二：手工迁移（等价）
+mv config.json data/config.json
+```
+
+**忘了迁移会怎样（本版最容易踩的坑）**：程序在新路径找不到配置 → **静默**生成一份新的随机 `api_key`，启动日志会打印一行「已生成推荐配置（api_key=…）」；客户端必须改成新 key，否则全部 401。
+
+> **看到「已生成推荐配置」就等于「旧配置没被读取」。** 不要指望日志里出现「检测到旧路径仍有配置但未被读取」——那条提示只在「你启用了迁移挂载、但拷贝失败」时才可能出现；最常见的升级路径（`git pull` 拿到新 compose）下容器内根本看不到旧 `./config.json`，该判定不会命中。
+
+> ⚠️ 前提是 `./data` 对容器身份**可写**。不可写时不会生成配置，而是回落默认值 + 环境变量：未另设 `WB2A_API_KEY` 时即为空 `api_key` = **不鉴权**（7863 对外映射时任何客户端都能调用）——启动日志有明确的 `不鉴权` 告警，先按「Docker 权限排障」对齐目录属主再重启。旧 `./config.json` 迁移后不再被读取，请删除以免混淆。
+
+**回滚**：把配置移回 `./config.json`，并恢复旧 `docker-compose.yml`（单文件挂载 + `user:` 行）与旧镜像。
 
 ### 工具脚本
 
@@ -672,7 +712,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 - **位置**：`./auths`（`auth_dir` 可配），文件名 `workbuddy-<uid>.json`
 - **内容**：明文 `accessToken` / `refreshToken` + 账号元信息（`account.uid` / `enterpriseId` / `nickname`）
-- **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 首次落盘遵循登录 umask，建议手动 `chmod 600 auths/*.json`
+- **权限**：容器身份由 `entrypoint.sh` 解析（默认跟随 `./auths`、`./data` 的属主，无需手工 chown）；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 首次落盘遵循登录 umask，建议手动 `chmod 600 auths/*.json`
 - **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`、`docs/` 及除 README 外的全部 `*.md` 工作文档
 
 ### 2. 网络暴露与日志敏感度
@@ -713,23 +753,26 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - 若上游真的返回 413/超限错误，网关按既有错误分类链路如实透传（不打码、不罚号——超限是请求侧问题）
 - 客户端中途断流导致的半截 body 在读入阶段即报 `400 invalid_request`，不会把截断 JSON 喂给上游（issue #41 语义保留在读错误路径）
 
-### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
+### Docker 权限排障（面板保存配置失败 / 凭证写入失败）
 
-容器以 `app` 用户（uid 10001）运行，而宿主机挂载的 `./auths`、`./data` 目录属主不是它——写凭证 tmp 文件被拒。三种解法任选（前两种均**无需 root 容器**）：
+默认部署（`docker compose up -d`，不指定 uid）会把容器身份自动解析成 `./auths`、`./data` 的属主，**不需要 chown**。按现象对照：
+
+**① `write config: … permission denied`（EACCES）**——配置所在目录对当前容器身份不可写。几乎都是因为 compose 里固定了 `user:`（此时 `entrypoint.sh` 不再自动对齐属主：容器内非 root 改不了宿主属主）。任选其一：
 
 ```bash
-# 方案 1（推荐，非 root）：让容器以你自己的 uid 运行——挂载目录本来就是你建的
-PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
-# 或写进 .env 文件长期生效（.env 已被 .gitignore 忽略）：
-#   echo "PUID=1000" > .env && echo "PGID=1000" >> .env
-
-# 方案 2：把挂载目录属主交给容器默认用户（需要 sudo）
-sudo chown -R 10001:10001 ./auths ./data ./config.json
-
-# 方案 3：compose 设 user: "0:0" 以 root 运行（NAS/群晖不便 chown 时用）
+# a) 让身份跟随目录属主（推荐）：注释掉 compose 里的 user: 行，再 up -d
+# b) 显式指定与目录属主一致的 uid（.env 会被 compose 透传进容器，entrypoint 直接采用）：
+echo "PUID=$(id -u)" >> .env && echo "PGID=$(id -g)" >> .env
+docker compose up -d --force-recreate
+# c) 或把宿主目录属主改成与容器身份一致：
+sudo chown -R 10001:10001 ./auths ./data
 ```
 
-报错信息里自带这条指引；compose 的 `user` 已参数化为 `${PUID:-10001}:${PGID:-10001}`。
+**② `replace config: … resource busy`（EBUSY）**——`config.json` 还是"单文件挂载"（1.11.x 之前的布局），`rename` 无法覆盖挂载点。按下面「升级说明」把配置迁到 `./data/config.json` 即可。
+
+**③ `read config: … permission denied` 且容器反复重启**——配置文件以 `0600` 写在别人名下，当前身份读不到。同 ① 对齐身份即可。
+
+登录后写 `auths/*.json.tmp` 报错同属 ① 类：让容器身份与 `./auths` 属主一致即可。
 
 ### 账号被 Disable 后如何恢复？
 

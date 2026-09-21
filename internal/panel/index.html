@@ -351,10 +351,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 /* ── Toast ───────────────────────────────────────────────────────── */
 #toasts { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
-.tst {
-  background: var(--raise); border: 1px solid var(--line); border-left: 3px solid var(--ink-3);
+.tst { background: var(--raise); border: 1px solid var(--line); border-left: 3px solid var(--ink-3);
   border-radius: 8px; padding: 10px 15px; font-size: 13px; box-shadow: var(--shadow); max-width: 380px;
-}
+  white-space: pre-line; }   /* 错误文案里的 \n 是可读分段，不要折成一行 */
 .tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
 
 @media (max-width: 760px) {
