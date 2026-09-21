@@ -36,7 +36,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 | 能力 | 说明 |
 |---|---|
-| 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证并重启容器加载新账号 |
+| 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证；凭证进池由目录监听在 5s 内完成，脚本末尾的重启容器属冗余步骤 |
 | 🔄 **多账号池** | 三因子加权随机选号（积分占比 ×10 + 闲置补偿 + 成功率 ×3），Top-5 候选 + 防惊群 |
 | 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
@@ -134,12 +134,14 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 |---|---|
 | **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、单号运维、批量任务、日志查看、明暗主题 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
+| **auths 目录热加载** | 运行期目录监听（5s 轮询指纹：文件名 + mtime + size）：新增 / 刷新 / 删除凭证文件自动进池，且**保留**既有账号的冷却、熔断与成本账本；目录不可读时自动降级为「加号需重启」 |
 | **在线配置编辑（热生效）** | 面板直接改 `./data/config.json`（目录挂载，`tmp+rename` 原子替换）：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
+| **请求统计（`/v1/stats`）** | 按模型聚合：请求/成功/失败/流式占比、平均首字与端到端延迟、生成吞吐、token 三段、缓存三段（命中率）、真实扣费，并合入 `credits` 倍率；采集只采信上游 `usage`（缺失≠0），纯内存累加、重启清零，`POST /v1/stats/reset` 可清零看增量 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 
@@ -279,7 +281,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 # 按提示在浏览器打开授权链接 → 回到终端确认 → 凭证落盘 auths/workbuddy-<uid>.json
 ```
 
-`login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + 凭证落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
+`login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + 凭证落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在启动时用 `auths/` 目录对齐，之后由**目录监听**（5s 轮询内容指纹）持续跟踪：新增 / 刷新 / 删除凭证文件都自动进池，无需重启。
 
 > Windows 用户请用方式 A（或 WSL）；`login.sh` 需要 python3。
 
@@ -291,6 +293,10 @@ curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
 
 # 账号状态（汇总 + 每账号详情，disabled 账号透出 disabled_reason）
 curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
+
+# 请求统计（按模型聚合 token/缓存/延迟/扣费；顺带合入 credits 倍率原文）
+curl -s http://localhost:7863/v1/stats -H "Authorization: Bearer your-api-key"
+curl -s -X POST http://localhost:7863/v1/stats/reset -H "Authorization: Bearer your-api-key"  # 清零看增量
 
 # 流式聊天
 curl -sN http://localhost:7863/v1/chat/completions \
@@ -532,9 +538,11 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；网关不设请求体上限（大请求由上游自然响应，见「排障」） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
+| `GET /v1/stats` | Bearer（`api_key` 非空时） | 按模型聚合的请求统计：请求/成功/失败/流式占比、平均 TTFB 与端到端耗时、生成吞吐、token 三段、缓存三段（命中率分母 = 命中 + 未命中，不含写入）、真实扣费；出口处从模型目录**只读快照**合入 `credits` 倍率原文（缓存冷则省略，缺失≠免费）。纯内存累加，进程重启清零（`since` 标出起点，模型键上限 512 防异常模型名刷爆内存） |
+| `POST /v1/stats/reset` | Bearer（`api_key` 非空时） | 清空统计累计（便于观察增量），返回 `{"ok":true}` |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
@@ -673,7 +681,7 @@ docker compose up -d --build
 
 | 脚本 | 用途 |
 |---|---|
-| `./login.sh` | OAuth 登录 → 落盘 auth → 重启容器 |
+| `./login.sh` | OAuth 登录 → 落盘 auth（目录监听 5s 内自动进池） |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
 | `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑（probe=只读 / report=单号上报 / unlock=单号领猫 / ALL=全池；写操作默认 dry-run，需 `--yes`） |
@@ -784,7 +792,7 @@ sudo chown -R <把 10001 换成你 user: 里的实际 uid>:<同上 gid> ./auths 
 
 ### 账号被 Disable 后如何恢复？
 
-- **用 `./login.sh` 重新登录**覆盖凭证，重启后自动回池；
+- **用 `./login.sh` 重新登录**覆盖凭证，目录监听 5s 内自动回池（无需重启）；
 - 或源码侧调用 `Pool.ReviveDisabled(uid)` 清除 `disabled` 状态（`state.json` 同步刷新）。
 
 ### 系统提示词被内容策略误杀怎么办？
