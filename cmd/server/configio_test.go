@@ -76,8 +76,10 @@ func TestConfigReplaceErrorClassifiesEBUSY(t *testing.T) {
 			t.Errorf("EBUSY 文案缺 %q: %v", want, err)
 		}
 	}
-	// 其他 rename 失败（EXDEV 等）不得套用 EBUSY 文案，避免误导。
-	other := configReplaceError("/x/config.json", &os.LinkError{Op: "rename", Err: syscall.EXDEV})
+	// 其他 rename 失败不得套用 EBUSY 文案，避免误导。
+	// 用平台中立的合成错误而不是某个 errno：EXDEV 在 plan9 的 syscall 里不存在，
+	// 会让 `GOOS=plan9 go vet ./cmd/server/` 直接编译不过（T3 实测）。
+	other := configReplaceError("/x/config.json", errors.New("invalid cross-device link"))
 	if strings.Contains(other.Error(), "挂载点") {
 		t.Errorf("非 EBUSY 错误不该出现 EBUSY 文案: %v", other)
 	}
