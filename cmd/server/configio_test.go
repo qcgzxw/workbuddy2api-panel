@@ -138,3 +138,23 @@ func TestIsSeparateMountIgnoresSymlink(t *testing.T) {
 		t.Error("符号链接被误判为独立挂载点")
 	}
 }
+
+// TestWriteConfigAtomicRenameFailureCleansTmp rename 失败（目标被占位成目录）时，
+// 不能把含 api_key 的 0600 tmp 留在配置目录里——EBUSY 现场每次保存失败都会留下它，
+// 排障时会看到与线上不一致的配置内容。
+func TestWriteConfigAtomicRenameFailureCleansTmp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.Mkdir(path, 0o700); err != nil { // 目标占位成目录 → rename(2) 必失败（EISDIR）
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "x"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err) // 填一个文件，避免平台差异下「空目录 rename 成功」
+	}
+	if err := writeConfigAtomic(path, []byte("{}")); err == nil {
+		t.Fatal("want error")
+	}
+	if _, err := os.Stat(path + ".tmp"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("rename 失败后 tmp 必须被清理, stat err=%v", err)
+	}
+}

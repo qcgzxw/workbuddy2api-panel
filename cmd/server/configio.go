@@ -22,6 +22,9 @@ func writeConfigAtomic(path string, out []byte) error {
 		return configWriteError(tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		// 清理 tmp：它是 0600、内容是含 api_key 的配置；EBUSY 现场（旧单文件挂载布局）
+		// 每次保存失败都会留下它，排障时会看到与线上不一致的配置内容。
+		_ = os.Remove(tmp)
 		return configReplaceError(path, err)
 	}
 	return nil
@@ -66,7 +69,8 @@ func readConfigError(path string, err error) error {
 func configPrecheck(path string) string {
 	dir := filepath.Dir(path)
 	// ① 目录可写性：用探针文件真实建删（比 access(2) 更贴近实际写路径，且跨平台）。
-	// 探针名固定、写完即删；进程被 kill 时最多留下一个 0 字节文件（在 data/ 里，已被 .gitignore 覆盖）。
+	// 探针名固定、写完即删；进程被 kill 时最多留下一个 0 字节文件（目标布局 ./data/config.json 下该目录已被 .gitignore 覆盖；
+	// 若配置落在未忽略的目录，它会短暂出现在 git status 里）。
 	probe := filepath.Join(dir, ".wb2a-writecheck")
 	if err := os.WriteFile(probe, nil, 0o600); err != nil {
 		return fmt.Sprintf("配置目录 %s 不可写（当前 uid=%d，目录属主 %s）：面板保存会失败，见 README「Docker 权限排障」",

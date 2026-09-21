@@ -1,7 +1,8 @@
-//go:build !windows
+//go:build unix
 
 // permcheck_unix.go 平台原语：目录属主文案 + "目标是否被单独挂载"判定。
 // 判定依据：被 bind mount 的文件其 st_dev 与所在目录不同；目录挂载内的普通文件则相同。
+// 标签用 unix 而非 !windows：unix 正是 syscall.Stat_t 存在的那组平台；!windows 更宽，会让 plan9 编译不过。
 package main
 
 import (
