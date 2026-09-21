@@ -617,7 +617,7 @@ http://127.0.0.1:7863/panel/
 多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：
 
 - **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
-- **身份自适应**：容器以 root 启动，`entrypoint.sh` 解析目标身份后 `su-exec` 降权 —— **主进程始终非 root**（`docker exec` 与 `HEALTHCHECK` 仍以容器默认身份执行，需要非 root 时加 `-u`）。默认无需指定 uid，root / 非 root 都能跑
+- **身份自适应**：容器以 root 启动，`entrypoint.sh` 解析目标身份后 `su-exec` 降权 —— **主进程始终非 root**（唯一例外：显式 `PUID=0` 逃生门；`docker exec` 与 `HEALTHCHECK` 另以容器默认身份执行，需要非 root 时加 `-u`）。默认无需指定 uid，root / 非 root 都能跑
 - `app/auths` 与 `app/data` 预建；镜像**不含任何配置文件**，首次启动自动生成随机 `api_key` 到 `/app/data/config.json`（日志打印一次）
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）
 
@@ -761,14 +761,14 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ```bash
 # a) 让身份跟随目录属主（推荐）：注释掉 compose 里的 user: 行，再 up -d
-# b) 显式指定与目录属主一致的 uid（.env 会被 compose 透传进容器，entrypoint 直接采用）：
+# b) 让 compose 的 user: 取与目录属主一致的 uid（.env 里的 PUID/PGID 由宿主侧插值生效）：
 echo "PUID=$(id -u)" >> .env && echo "PGID=$(id -g)" >> .env
 docker compose up -d --force-recreate
 # c) 或把宿主目录属主改成与容器身份一致：
 sudo chown -R 10001:10001 ./auths ./data
 ```
 
-**② `replace config: … resource busy`（EBUSY）**——`config.json` 还是"单文件挂载"（1.11.x 之前的布局），`rename` 无法覆盖挂载点。按「升级说明」（见「部署运维」）把配置迁到 `./data/config.json` 即可。
+**② `replace config: … resource busy`（EBUSY）**——`config.json` 还是"单文件挂载"（`./config.json:/app/config.json`，本版之前的布局），`rename` 无法覆盖挂载点。按「升级说明」（见「部署运维」）把配置迁到 `./data/config.json` 即可。
 
 **③ `read config: … permission denied` 且容器反复重启**——配置文件以 `0600` 写在别人名下，当前身份读不到。同 ① 对齐身份即可。
 
