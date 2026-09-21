@@ -27,6 +27,12 @@ func TestClassify(t *testing.T) {
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
+		// issue #175：14018 明确表示账号积分耗尽，即使 HTTP 状态是 429 也必须
+		// 走硬积分冷却；仅有相同文案而无该业务码的普通 429 仍保持软限流。
+		{429, `{"code":14018,"msg":"Credits exhausted"}`, ErrHardCredit},
+		{429, `{"error":{"data":{"code":"14018","msg":"Credits exhausted"}}}`, ErrHardCredit},
+		{429, `{"requestId":"14018","msg":"Credits exhausted"}`, ErrSoftRate},
+		{429, `{"code":1,"msg":"Credits exhausted"}`, ErrSoftRate},
 		// 限流文案（issue #28）：状态码不是 429 时也必须识别为软限流，
 		// 否则账号不会被冷却，下次请求仍会被选中。
 		{200, `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`, ErrSoftRate},
@@ -49,6 +55,18 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		// 图片格式/数据错误是确定性请求错误，分类后不轮转、不罚号。
+		{400, `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent"}`, ErrImageInvalid},
+		{400, `{"code":11135,"msg":"invalid_image_data"}`, ErrImageInvalid},
+		{400, `invalid_image_data`, ErrImageInvalid},
+		// code 11135 的 JSON 空白容差（Copilot review #184 finding）：字面量 marker
+		// 只能命中紧凑形态，带空格的合法 body 会退化成 ErrClient 并继续轮转。
+		// 与 hint.go 的 isInvalidImageData / codeMarker 同口径。
+		{400, `{"code": 11135, "msg": "image rejected"}`, ErrImageInvalid},
+		{400, `{"code": "11135", "msg": "image rejected"}`, ErrImageInvalid},
+		{400, `{"error": {"code": 11135, "message": "image rejected"}}`, ErrImageInvalid},
+		// 其他 code 不得被 11135 口径误伤（防过宽）。
+		{400, `{"code": 11133, "msg": "other business error"}`, ErrClient},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},

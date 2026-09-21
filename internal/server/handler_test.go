@@ -581,6 +581,86 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	}
 }
 
+// TestChat429Code14018UsesHardCreditCooldown 回归 issue #175：HTTP 429 + code 14018
+// （上游明确的账号积分耗尽）必须走硬积分冷却，而不是被通用 429 兜底误判为可自愈的
+// 软限流——后者会让积分耗尽的号在全池冷却时被反复兜底选中。
+func TestChat429Code14018UsesHardCreditCooldown(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":14018,"msg":"Credits exhausted"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0) // bad 积分高，确定性源 → 先被选中
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	st, ok := p.Status("bad")
+	if !ok || !st.Cooling {
+		t.Fatalf("14018 account should be cooling: %+v ok=%v", st, ok)
+	}
+	if st.Reason != "余额不足" || st.Until.Hour() != 4 {
+		t.Fatalf("14018 should use hard-credit cooldown, got reason=%q until=%v", st.Reason, st.Until)
+	}
+	if got := p.Pick(); got == nil || got.UID != "good" {
+		t.Fatalf("hard-cooled 14018 account must not be fallback-picked, got %+v", got)
+	}
+}
+
+// TestChatImageInvalidPassesThroughWithoutRotation 上游图片错误是请求级确定性
+// 错误：多账号池只调用一次，不冷却/禁用/累计失败，并逐字透传上游原文。
+func TestChatImageInvalidPassesThroughWithoutRotation(t *testing.T) {
+	const raw = `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent","requestId":"req-image-abc"}`
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return http.StatusBadRequest, raw, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "img-a1", AccessToken: "at-img-1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "img-a2", AccessToken: "at-img-2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","messages":[{"role":"user","content":[{"type":"image_url","image_url":"data:image/png;base64,QUJD"}]}]}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s want 400", rec.Code, rec.Body)
+	}
+	var e struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	if e.Error.Code != "image_invalid" {
+		t.Errorf("code=%q want image_invalid", e.Error.Code)
+	}
+	if e.Error.Message != raw {
+		t.Errorf("message=%q want raw upstream body passthrough %q", e.Error.Message, raw)
+	}
+	if calls["Bearer at-img-1"]+calls["Bearer at-img-2"] != 1 {
+		t.Errorf("upstream calls=%v want exactly 1 (no rotation for invalid image)", calls)
+	}
+	for _, uid := range []string{"img-a1", "img-a2"} {
+		st, _ := p.Status(uid)
+		if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+			t.Errorf("%s must not be penalized for request-level image error: %+v", uid, st)
+		}
+	}
+}
+
 // TestChat6004ModelResetCoolsToParsedTime 端到端回归 issue #31：上游 429 + code 6004
 // +「将在 … 重置」→ 冷却 until 精确等于解析时间（而非 600s 固定基数/指数退避），
 // 且记录触发模型 → 同模型请求仍被冷却、切模型请求按豁免可选。
