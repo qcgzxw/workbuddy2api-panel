@@ -49,8 +49,8 @@ func isSeparateMount(dir, path string) bool {
 func permHintSuffix(dir string) string {
 	owner := dirOwnerString(dir)
 	if owner == fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()) {
-		return fmt.Sprintf("当前 uid=%d，目录 %s 属主与进程一致（%s）：目录 mode/ACL 不允许写入。"+
-			"见 README「Docker 权限排障」", os.Getuid(), dir, owner)
+		return fmt.Sprintf("当前 uid=%d，目录 %s 属主与进程一致（%s）：目录 mode/ACL 不允许写入"+
+			"（也可能是只读挂载或磁盘空间不足）。见 README「Docker 权限排障」", os.Getuid(), dir, owner)
 	}
 	return fmt.Sprintf("当前 uid=%d，目录属主 %s。默认部署会按挂载目录属主自动适配身份；"+
 		"若在 compose 里固定了 user:，请改设 PUID/PGID 或让目录属主与之匹配。见 README「Docker 权限排障」",

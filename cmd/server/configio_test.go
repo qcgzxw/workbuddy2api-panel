@@ -60,6 +60,11 @@ func TestWriteConfigAtomicDirUnwritableIsActionable(t *testing.T) {
 	if !strings.Contains(err.Error(), "Docker 权限排障") {
 		t.Errorf("错误文案缺少可操作指引: %v", err)
 	}
+	// 区分性断言：本用例是"自己的目录 chmod 0500"（属主与进程一致），必须走"属主一致"这支；
+	// 「Docker 权限排障」两支都含，单靠它无法把措辞改错钉住。
+	if !strings.Contains(err.Error(), "属主与进程一致") {
+		t.Errorf("属主一致时才该走这支措辞: %v", err)
+	}
 }
 
 // TestConfigReplaceErrorClassifiesEBUSY EBUSY 只有一个已知成因：目标是被单独挂载的文件
@@ -230,9 +235,13 @@ func TestIsLoopbackListen(t *testing.T) {
 	}{
 		{":7863", false},
 		{"0.0.0.0:7863", false},
+		{"[::]:7863", false}, // IPv6 全接口（0.0.0.0 的对偶）——最可能的漏报点
 		{"127.0.0.1:7863", true},
+		{"127.0.0.2:7863", true}, // 守 127/8 整段，而不是精确匹配 127.0.0.1
 		{"[::1]:7863", true},
+		{"[::ffff:127.0.0.1]:7863", true}, // 守 v4-mapped 分支
 		{"localhost:7863", true},
+		{"LOCALHOST:7863", true}, // 守 strings.EqualFold
 		{"example.com:7863", false},
 		{"7863", false}, // SplitHostPort 失败
 	}

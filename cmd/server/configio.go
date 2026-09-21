@@ -69,8 +69,10 @@ func readConfigError(path string, err error) error {
 // 只告警、不阻断启动——存量旧布局的部署必须能起来，才谈得上按 README 迁移。
 func configPrecheck(path string) string {
 	dir := filepath.Dir(path)
-	// ① 目录可写性：探针文件真实建删（比 access(2) 更贴近实际写路径，且跨平台）。
-	// 用 CreateTemp 而非固定名：不覆盖目录里同名既有文件，多实例并发也各写各的。
+	// ① 目录可写性：用探针文件真实建删（比 access(2) 更贴近实际写路径，且跨平台）。
+	// 探针名带随机后缀、写完即删；进程被 kill 时最多留下一个 0 字节文件（目标布局 ./data/config.json
+	// 下该目录已被 .gitignore 覆盖）。用 CreateTemp 而非固定名：不覆盖目录里同名既有文件，
+	// 多实例并发也各写各的。
 	f, err := os.CreateTemp(dir, ".wb2a-writecheck*")
 	if err != nil {
 		if s := permHintSuffix(dir); s != "" {
