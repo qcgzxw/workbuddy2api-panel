@@ -164,8 +164,17 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "重启 $CONTAINER 加载新账号..."
     docker restart "$CONTAINER" >/dev/null
     sleep 2
-    # API_KEY 从 config.json 读取（该变量在脚本中未定义，fallback 仅为占位，不会通过鉴权）
-    API_KEY=$(python3 -c "import json; print(json.load(open('config.json')).get('api_key',''))" 2>/dev/null)
+    # API_KEY 从配置读取，按新→旧顺序取第一个存在的：WB2A_CONFIG → data/config.json（新布局，
+    # 容器内即 /app/data/config.json）→ config.json（旧布局，迁移窗口期仍可命中）。
+    # 三条都是相对 CWD，宿主（仓库根）与容器内（/app）两种跑法都成立。
+    # 都读不到时 fallback 仅为占位，不会通过鉴权。
+    API_KEY=$(python3 -c '
+import json, os
+for c in [os.environ.get("WB2A_CONFIG") or "", "data/config.json", "config.json"]:
+    if c and os.path.exists(c):
+        print(json.load(open(c)).get("api_key", ""))
+        break
+' 2>/dev/null)
     COUNT=$(curl -s http://127.0.0.1:7863/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
     echo "服务已重启，当前账号数: $COUNT"
 else
