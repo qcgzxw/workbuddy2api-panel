@@ -98,6 +98,20 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 	return infos
 }
 
+// GlobalModelInfosSnapshot 只读 global 模型目录全字段缓存（TTL 内快照）；
+// 冷 / 过期 / 窄表形态 / 未探测 → nil。**不发起任何上游探测**——这正是与
+// FetchGlobalModelInfos 的差异点（那个在缓存 miss 时触发探测，服务 /v1/models；
+// 本方法服务 /v1/stats 的倍率透出，只读已有数据，缓存冷就冷）。
+// 吸收上游 1dfe750（issue #176 的第一条）。
+func (c *Client) GlobalModelInfosSnapshot() []ModelInfo {
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	if len(c.globalModels.infos) == 0 || time.Since(c.globalModels.fetched) >= globalModelsTTL {
+		return nil
+	}
+	return c.globalModels.infos
+}
+
 // fetchGlobalModelsOnce 单次探测决策（缓存命中/负缓存/触发探测），返回 (names, infos)。
 // 纯动态：成功 = 并集结果去重；一切失败 = nil（不回落静态）。
 // infos 仅对象形态成功探测时非 nil。

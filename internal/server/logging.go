@@ -41,6 +41,16 @@ type chatStat struct {
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
 
+	// metrics 采集字段（供 /v1/stats 聚合，吸收上游 733d348）：全部来自上游 usage，
+	// 缺失时保持零值并由 hasUsage 区分「缺观测」与「显式 0」——与成本账本同一纪律。
+	hasUsage  bool
+	prompt    int
+	cacheHit  int
+	cacheMiss int
+	cacheWr   int
+	credit    float64
+	hasCredit bool
+
 	logged bool
 }
 
@@ -53,13 +63,18 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
 }
 
-// done 幂等落一行表格日志。
+// done 幂等落一行表格日志，并把本次请求记入 metrics 聚合（/v1/stats 数据源）。
+//
+// 单一埋点：流式 / 非流式 / 各类错误路径最终都汇到此处，故 metrics 天然覆盖全路径，
+// 不需要在每个 return 前重复记账（重复记账反而会漏分支或双计）。
 func (s *chatStat) done() {
 	if s.logged {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks)
+	total := time.Since(s.start)
+	logChatRow(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks)
+	recordChatMetric(s, total)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -79,6 +94,10 @@ type chatStatsReader struct {
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
 	hasCredit bool
 	credit    float64
+	// 缓存三段（上游实测字段名），供 /v1/stats 的命中率聚合（吸收上游 733d348）。
+	cacheHit  int
+	cacheMiss int
+	cacheWr   int
 	pend      []byte // 已读未返回的行缓存
 }
 
@@ -95,6 +114,12 @@ func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.ha
 
 // Credit 返回末帧 usage.credit（本次真实扣费积分）与是否缺失。
 func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
+
+// CacheTokens 返回末帧 usage 的缓存三段（命中 / 未命中 / 写入），
+// 供 /v1/stats 的命中率聚合（分母 = 命中 + 未命中，不含写入）。
+func (s *chatStatsReader) CacheTokens() (hit, miss, write int) {
+	return s.cacheHit, s.cacheMiss, s.cacheWr
+}
 
 // TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
 func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
@@ -131,6 +156,10 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			CompletionTokens *int     `json:"completion_tokens"`
 			TotalTokens      *int     `json:"total_tokens"`
 			Credit           *float64 `json:"credit"`
+			// 缓存三段（上游实测字段名，见 /v1/stats 的 cache_* 口径）。
+			PromptCacheHitTokens   *int `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTokens  *int `json:"prompt_cache_miss_tokens"`
+			PromptCacheWriteTokens *int `json:"prompt_cache_write_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -147,6 +176,15 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if chunk.Usage.TotalTokens != nil {
 		s.hasTotalTokens = true
 		s.totalTokens = *chunk.Usage.TotalTokens
+	}
+	if chunk.Usage.PromptCacheHitTokens != nil {
+		s.cacheHit = *chunk.Usage.PromptCacheHitTokens
+	}
+	if chunk.Usage.PromptCacheMissTokens != nil {
+		s.cacheMiss = *chunk.Usage.PromptCacheMissTokens
+	}
+	if chunk.Usage.PromptCacheWriteTokens != nil {
+		s.cacheWr = *chunk.Usage.PromptCacheWriteTokens
 	}
 	if chunk.Usage.Credit != nil {
 		s.hasCredit = true
@@ -204,6 +242,31 @@ func parseModelFromBody(body []byte) string {
 	return obj.Model
 }
 
+// usageInt 从 usage map 取整数字段，容忍上游 JSON 解出的多种数值类型；缺失或
+// 类型不符返回 false。usageDeltaFromResponse（用量账本）与 fillStatFromUsage
+// （/v1/stats 采集）共用，避免"取数口径"在两处各写一份而走样。
+func usageInt(u map[string]any, key string) (int64, bool) {
+	v, ok := u[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case float32:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	case json.Number:
+		i, err := n.Int64()
+		return i, err == nil
+	default:
+		return 0, false
+	}
+}
+
 // usageDeltaFromResponse 从非流式聚合响应中提取明确存在的 token 字段。
 func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	delta := pool.TokenUsageDelta{}
@@ -211,34 +274,13 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	if !ok {
 		return delta
 	}
-	read := func(key string) (int64, bool) {
-		v, ok := u[key]
-		if !ok {
-			return 0, false
-		}
-		switch n := v.(type) {
-		case float64:
-			return int64(n), true
-		case float32:
-			return int64(n), true
-		case int:
-			return int64(n), true
-		case int64:
-			return n, true
-		case json.Number:
-			i, err := n.Int64()
-			return i, err == nil
-		default:
-			return 0, false
-		}
-	}
-	if n, ok := read("prompt_tokens"); ok {
+	if n, ok := usageInt(u, "prompt_tokens"); ok {
 		delta.HasPromptTokens, delta.PromptTokens = true, n
 	}
-	if n, ok := read("completion_tokens"); ok {
+	if n, ok := usageInt(u, "completion_tokens"); ok {
 		delta.HasCompletionTokens, delta.CompletionTokens = true, n
 	}
-	if n, ok := read("total_tokens"); ok {
+	if n, ok := usageInt(u, "total_tokens"); ok {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
 	}
 	return delta
