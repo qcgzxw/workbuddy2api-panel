@@ -10,10 +10,12 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -80,11 +82,10 @@ func main() {
 	if warn := configPrecheck(*cfgPath); warn != "" {
 		log.Printf("WARN: %s", warn)
 	}
-	// 空 api_key = 不鉴权（config.go 既有语义：httpauth.VerifyBearer 对空 key 直接放行）。
-	// 容器里 7863 默认对外映射，"配置不存在 + 目录不可写 → 回落 Load("")" 这条路径会静默
-	// 变成无鉴权（entrypoint 已在启动期 WARN 一次，这里补程序侧的权威告警）。
-	if cfg.APIKey == "" {
-		log.Printf("WARN: 未设置 api_key（空 = 不鉴权）：7863 对外映射时任何客户端都可调用。见 README「升级说明」")
+	// 空 api_key = 不鉴权；只在**非回环**监听时告警——本机/受控环境用空 key 是文档化的
+	// 合法模式（README「安全与合规」），每次都打会让人去"修"一个没坏的东西。
+	if cfg.APIKey == "" && !isLoopbackListen(cfg.Listen) {
+		log.Printf("WARN: 未设置 api_key（空 = 不鉴权）且 %s 非回环监听：任何可达客户端都可调用。见 README「升级说明」", cfg.Listen)
 	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
@@ -328,6 +329,27 @@ func panelListenPath(listen string) string {
 		}
 	}
 	return listen
+}
+
+// isLoopbackListen 报告 listen 地址是否只绑定回环。
+// ":7863"（空 host = 全部接口）→ false；"127.0.0.1:7863" / "[::1]:7863" / "localhost:7863" → true。
+// 解析不了（含域名）一律按"可能对外"处理：宁可多告警，不漏告警。
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。

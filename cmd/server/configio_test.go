@@ -123,9 +123,9 @@ func TestConfigPrecheckSilentOnNormalFile(t *testing.T) {
 	if warn := configPrecheck(path); warn != "" {
 		t.Errorf("正常布局不该有 WARN: %s", warn)
 	}
-	// 探针必须被清掉。
-	if _, err := os.Stat(filepath.Join(dir, ".wb2a-writecheck")); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("探针未清理, stat err=%v", err)
+	// 探针必须被清掉（CreateTemp 名带随机后缀，用 glob）。
+	if left, _ := filepath.Glob(filepath.Join(dir, ".wb2a-writecheck*")); len(left) != 0 {
+		t.Errorf("探针未清理: %v", left)
 	}
 }
 
@@ -219,5 +219,26 @@ func TestReadConfigErrorEACCESIsActionable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Docker 权限排障") {
 		t.Errorf("EACCES 文案缺少指引: %v", err)
+	}
+}
+
+// TestIsLoopbackListen 空 host/域名/不可解析一律按"可能对外"处理（宁可多告警）。
+func TestIsLoopbackListen(t *testing.T) {
+	cases := []struct {
+		addr string
+		want bool
+	}{
+		{":7863", false},
+		{"0.0.0.0:7863", false},
+		{"127.0.0.1:7863", true},
+		{"[::1]:7863", true},
+		{"localhost:7863", true},
+		{"example.com:7863", false},
+		{"7863", false}, // SplitHostPort 失败
+	}
+	for _, c := range cases {
+		if got := isLoopbackListen(c.addr); got != c.want {
+			t.Errorf("isLoopbackListen(%q)=%v want %v", c.addr, got, c.want)
+		}
 	}
 }

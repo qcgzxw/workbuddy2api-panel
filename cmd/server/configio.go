@@ -69,16 +69,17 @@ func readConfigError(path string, err error) error {
 // 只告警、不阻断启动——存量旧布局的部署必须能起来，才谈得上按 README 迁移。
 func configPrecheck(path string) string {
 	dir := filepath.Dir(path)
-	// ① 目录可写性：用探针文件真实建删（比 access(2) 更贴近实际写路径，且跨平台）。
-	// 探针名固定、写完即删；进程被 kill 时最多留下一个 0 字节文件（目标布局 ./data/config.json 下该目录已被 .gitignore 覆盖；
-	// 若配置落在未忽略的目录，它会短暂出现在 git status 里）。
-	probe := filepath.Join(dir, ".wb2a-writecheck")
-	if err := os.WriteFile(probe, nil, 0o600); err != nil {
+	// ① 目录可写性：探针文件真实建删（比 access(2) 更贴近实际写路径，且跨平台）。
+	// 用 CreateTemp 而非固定名：不覆盖目录里同名既有文件，多实例并发也各写各的。
+	f, err := os.CreateTemp(dir, ".wb2a-writecheck*")
+	if err != nil {
 		if s := permHintSuffix(dir); s != "" {
 			return fmt.Sprintf("配置目录 %s 不可写：%s", dir, s)
 		}
 		return fmt.Sprintf("配置目录 %s 不可写：面板保存会失败；请检查目录权限", dir)
 	}
+	probe := f.Name()
+	_ = f.Close()
 	_ = os.Remove(probe)
 	// ② 挂载形态：目标若是被单独挂载的文件，tmp+rename 必然 EBUSY。
 	if isSeparateMount(dir, path) {

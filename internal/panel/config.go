@@ -43,6 +43,10 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	restartRequired, err := p.cfg.SaveConfig(raw)
 	if err != nil {
+		// 服务端留痕：面板 toast 3.6s 后自动消失（app.js 的 setTimeout remove），失败现场只有
+		// 开 devtools 才看得到；而这条错误常带着运维要照着做的指引（"请把配置放进目录挂载"等），
+		// 必须有处可查。与成功分支的 log.Printf 对称。
+		log.Printf("panel: 配置保存失败: %v", err)
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
