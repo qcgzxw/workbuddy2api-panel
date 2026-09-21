@@ -167,7 +167,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | ✅ 已修复 | ~~single 类任务奖励领取~~ | **领奖已打通**：正确端点是 Web 域 `POST https://www.workbuddy.cn/activity/growth/tasks/<task_code>/claim`（任务码在路径、无 body、`x-client-platform: web`）。此前误用 CLI 域 `copilot.tencent.com/v2/.../reward/claim` 导致长期 400。「一键完成」现已**达标即自动领奖**（含异步计分等待），面板也可手动领取。实测 +100 分 +5 能到账、重复领取幂等 |
 | ✅ 已破解 | ~~桌面端 / 交互类任务~~ | 通过客户端指纹逆向（`/v2/report` 三通道 + 判据事件载荷），**17/18 任务可纯 API 一键完成**：`RichMeow_Chat`（桌面 6 事件链）、`Buddy_App(_QQ)`、`automation_1`、`Library_read`、`template_5`、`playbook_prompt`、`create_canvas`、`expert_5`、`Expert_team_use_3`、`Expert_lighthouse`、`Hp_Appearance`、`skill_1`、`black_cat`（夜间窗口自动补足）等，多账号实测点亮 |
 | ⚠️ 不支持 | **剩余 1 个任务** | `Expert_Philanthropy`（需真实捐款：服务端领奖时校验捐赠回执，已实测无法绕过）；面板展示指引 |
-| ❌ 未做 | **面板侧 Upstash / 凭证目录配置** | 涉及启动期装配，需手工编辑 `config.json`（面板会提示为重启项） |
+| ❌ 未做 | **面板侧 Upstash / 凭证目录配置** | 涉及启动期装配，需手工编辑配置文件（Docker 部署下即 `./data/config.json`；面板会提示为重启项） |
 | ❌ 未做 | **HTTPS / 内置限流** | 设计上交给反向代理（Nginx / Caddy）。服务本身只提供明文 HTTP，公网部署**必须**置于 HTTPS 反代之后 |
 
 ## 架构总览
@@ -644,13 +644,18 @@ http://127.0.0.1:7863/panel/
 
 ```bash
 # 方式一：让容器自己迁移（推荐，不需要 sudo，root 属主的旧文件也能读）
-#   1) 取消 docker-compose.yml 里这两行的注释：
+#   1) 取消 docker-compose.yml 里**那一行**迁移挂载的注释：
 #        # - ./config.json:/app/config.json:ro
-#   2) docker compose up -d    → 启动日志出现「已把旧 ./config.json 迁移到 ./data/config.json」
-#   3) 确认 ./data/config.json 里的 api_key 正确后，删除宿主 ./config.json 与那两行挂载，再 up -d 一次
+#   2) **必须 `--build`**：迁移逻辑在新 entrypoint.sh 里，而本仓 compose 是 build: .（无预编译发布），
+#      直接 up -d 会复用旧镜像（旧 ENTRYPOINT/旧 USER），迁移永远不会发生：
+#        docker compose up -d --build
+#      确认：docker compose logs | grep 迁移     → 期望「已把旧 ./config.json 迁移到 ./data/config.json」
+#   3) 确认 ./data/config.json 里的 api_key 正确后，删除宿主 ./config.json 与那一行迁移挂载，再 up -d 一次
 
-# 方式二：手工迁移（等价）
+# 方式二：手工迁移（在仓库根执行；随后**同样要 `docker compose up -d --build`** 才等价——
+# 否则容器里仍读不到新路径。与方式一的差别仅是"谁来搬文件"）
 mv config.json data/config.json
+docker compose up -d --build
 ```
 
 **忘了迁移会怎样（本版最容易踩的坑）**：程序在新路径找不到配置 → **静默**生成一份新的随机 `api_key`，启动日志会打印一行「已生成推荐配置（api_key=…）」；客户端必须改成新 key，否则全部 401。
@@ -659,7 +664,7 @@ mv config.json data/config.json
 
 > ⚠️ 前提是 `./data` 对容器身份**可写**。不可写时不会生成配置，而是回落默认值 + 环境变量：未另设 `WB2A_API_KEY` 时即为空 `api_key` = **不鉴权**（7863 对外映射时任何客户端都能调用）——启动日志有明确的 `不鉴权` 告警，先按「Docker 权限排障」对齐目录属主再重启。旧 `./config.json` 迁移后不再被读取，请删除以免混淆。
 
-**回滚**：把配置移回 `./config.json`，并恢复旧 `docker-compose.yml`（单文件挂载 + `user:` 行）与旧镜像。
+**回滚**：把配置移回 `./config.json`，`git checkout <升级前的提交>` 后用同一 tag 重新 `docker compose build && docker compose up -d`。
 
 ### 工具脚本
 
@@ -765,7 +770,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 echo "PUID=$(id -u)" >> .env && echo "PGID=$(id -g)" >> .env
 docker compose up -d --force-recreate
 # c) 或把宿主目录属主改成与容器身份一致：
-sudo chown -R 10001:10001 ./auths ./data
+sudo chown -R <把 10001 换成你 user: 里的实际 uid>:<同上 gid> ./auths ./data
 ```
 
 **② `replace config: … resource busy`（EBUSY）**——配置仍挂在单文件挂载 `./config.json:/app/config.json`（旧布局；本版已改为目录挂载 `./data/config.json`），`rename(2)` 无法覆盖挂载点。按「升级说明」（见「部署运维」）迁到 `./data/config.json` 即可。

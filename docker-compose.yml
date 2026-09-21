@@ -23,6 +23,7 @@ services:
       # config.json 成为挂载点，而 rename(2) 不允许覆盖挂载点 —— 面板保存恒报 EBUSY。
       # 首次启动若 ./data/config.json 不存在，程序会自动生成一份（随机 api_key，日志打印）。
       - ./data:/app/data
-      # 旧版布局迁移用（一次性）：取消注释、up -d 一次完成迁移，确认后删掉这两行。
+      # 旧版布局迁移用（一次性）：取消注释后 `docker compose up -d --build` 完成迁移（**必须 --build**：
+      # 迁移逻辑在新 entrypoint.sh 里，直接 up -d 会复用旧镜像、迁移不会发生），确认后删掉**这一行**。
       # 全新部署**不要**启用——宿主缺少 ./config.json 时 Docker 会把它建成同名目录。
       # - ./config.json:/app/config.json:ro
