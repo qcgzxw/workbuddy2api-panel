@@ -164,24 +164,31 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "重启 $CONTAINER 加载新账号..."
     docker restart "$CONTAINER" >/dev/null
     sleep 2
-    # API_KEY 从配置读取，按新→旧顺序取第一个存在的：WB2A_CONFIG → data/config.json（新布局，
-    # 容器内即 /app/data/config.json）→ config.json（旧布局，迁移窗口期仍可命中）。
-    # 三条都是相对 CWD，宿主（仓库根）与容器内（/app）两种跑法都成立。
+    # API_KEY 从配置读取，按新→旧顺序取第一个存在的：WB2A_CONFIG → data/config.json → config.json。
+    # 容器内由 entrypoint.sh 通过 WB2A_CONFIG（绝对路径 /app/data/config.json）命中；
+    # 相对候选 data/config.json 服务于"宿主未设该变量直接跑 ./login.sh"的跑法（脚本已 cd 到自身目录）。
     # 都读不到时 API_KEY 为空，下面 fallback 仅为占位，不会通过鉴权。
-    # 注意本脚本是 set -euo pipefail：候选文件若解析失败必须 continue，否则一次 json 报错
-    # 会让脚本在半路（auth 已落盘、容器已重启之后）直接中止、连完成提示都不打。
-    API_KEY=$(python3 -c '
-import json, os
+    # 用 heredoc 而非 python3 -c '…'（本文件其余 python 块同款）：-c 单引号里藏这段脚本时，
+    # 将来往注释/字面量里加一个 ' 就会让 python 收到截断源码；这里保留 stderr 不重定向，
+    # 让"候选读不到/解析失败"能自证（否则只剩一行 COUNT=? 无从判断）。
+    # 注意本脚本是 set -euo pipefail：候选解析失败必须 continue，不能让它 abort（那时 auth
+    # 已落盘、容器已重启，脚本半路退出连完成提示都不打）。
+    API_KEY=$(python3 - <<'PYEOF'
+import json, os, sys
 for c in [os.environ.get("WB2A_CONFIG") or "", "data/config.json", "config.json"]:
     if not c or not os.path.exists(c):
         continue
     try:
         v = json.load(open(c)).get("api_key", "")
-    except Exception:
-        continue          # 候选损坏（半截写入/手工改坏）就跳过，别让它 abort 整个脚本
+    except Exception as e:
+        print(f"WARN: 跳过配置 {c}: {e}", file=sys.stderr)
+        continue
+    if not v:
+        print(f"WARN: 配置 {c} 没有 api_key（空值 = 不鉴权）", file=sys.stderr)
     print(v)
     break
-' 2>/dev/null)
+PYEOF
+)
     COUNT=$(curl -s http://127.0.0.1:7863/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
     echo "服务已重启，当前账号数: $COUNT"
 else
