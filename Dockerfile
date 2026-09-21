@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.23-alpine AS build
+# builder 跟随上游（吸收 3b30809）：镜像内跑的是 CGO_ENABLED=0 静态二进制，
+# 标准库漏洞会**编进**最终二进制，builder 版本即是运行期 stdlib 版本——
+# 只升级基础镜像（alpine）不解决这条。go.mod 的 go 指令（1.22.5）是语言特性下限，
+# 与 builder 版本无冲突（新工具链编译旧指令模块是支持的组合）。
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download
