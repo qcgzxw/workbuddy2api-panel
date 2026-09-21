@@ -39,17 +39,22 @@ esac
 # 仅当目标缺失、且旧路径确实是被单独挂载的文件（st_dev 与 /app 不同）时才当作旧配置——
 # 避免把镜像内任何自带文件误当配置。用 tmp + mv 保证原子：中途被 kill 不会留下截断的
 # 配置（截断文件会让下次启动判为"已存在"而永不重试，程序读到非法 JSON 进重启循环）。
+# 不加 2>/dev/null：失败时把 syscall 级原因留给运维看，别让 WARN 去猜成因。
 MIGRATED=""
 if [ ! -e "$CONFIG" ] && [ -f /app/config.json ] &&
    [ "$(stat -c %d /app/config.json)" != "$(stat -c %d /app)" ]; then
-  if cp /app/config.json "$CONFIG.tmp" 2>/dev/null && mv "$CONFIG.tmp" "$CONFIG" 2>/dev/null; then
+  if cp /app/config.json "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"; then
     MIGRATED=1
     echo "entrypoint: 已把旧 ./config.json 迁移到 ./data/config.json（旧文件不再被读取，确认后删除该挂载）" >&2
   else
     rm -f "$CONFIG.tmp" 2>/dev/null || true
-    echo "WARN: 旧 ./config.json 存在但写不进 $CONFIG（配置目录对当前身份不可写？）。" >&2
-    echo "WARN: 后果：本次将以空 api_key 启动 = **不鉴权**（7863 已对外映射），且旧配置不会被读取。" >&2
-    echo "WARN: 请立即按 README「升级说明」迁移，或先按「Docker 权限排障」对齐目录属主。" >&2
+    echo "WARN: 旧 ./config.json 迁移失败（原因见上方错误输出）。" >&2
+    if [ -w "$DATA" ]; then
+      echo "WARN: $DATA 可写 → 程序将自动生成随机 api_key；旧配置未被读取，客户端需改用新 key。" >&2
+    else
+      echo "WARN: 且 $DATA 对当前身份不可写 → 本次将以空 api_key 启动 = **不鉴权**（7863 已对外映射）。" >&2
+    fi
+    echo "WARN: 见 README「升级说明」/「Docker 权限排障」。" >&2
   fi
 fi
 
@@ -82,8 +87,16 @@ fi
 for d in /app/auths /app/data; do
   [ -w "$d" ] || echo "WARN: $d 对 uid=$(id -u) 不可写，面板保存/落盘会失败，见 README「Docker 权限排障」" >&2
 done
-if [ ! -r "$CONFIG" ]; then
-  echo "WARN: 配置 $CONFIG 不存在或不可读：程序会尝试自动生成；若目录不可写则回落空 api_key" >&2
-  echo "WARN: = **不鉴权**（7863 对外映射）。见 README「升级说明」/「Docker 权限排障」。" >&2
+# 配置三态分开说，别把"会自动生成随机 key"与"会以空 key 不鉴权"混成一句：
+# 假警报会让运维学会无视这条 WARN，反而毁掉它想传达的信息。
+if [ ! -e "$CONFIG" ]; then
+  if [ -w "$DATA" ]; then
+    echo "WARN: 配置 $CONFIG 不存在：程序会自动生成一份（随机 api_key，日志会打印一次）。见 README「升级说明」。" >&2
+  else
+    echo "WARN: 配置 $CONFIG 不存在且 $DATA 对 uid=$(id -u) 不可写 → 将以空 api_key 启动 = **不鉴权**（7863 对外映射）。" >&2
+  fi
+elif [ ! -r "$CONFIG" ]; then
+  echo "WARN: 配置 $CONFIG 存在但当前身份读不到 → 程序启动会失败并反复重启（**不是**不鉴权）。" >&2
+  echo "WARN: 请对齐文件属主，见 README「Docker 权限排障」。" >&2
 fi
 exec "$@"
