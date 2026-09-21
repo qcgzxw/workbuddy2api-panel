@@ -321,8 +321,8 @@ func (a *Auth) SaveAtomic() error {
 	}
 	tmp := a.FilePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
-		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
+		// Docker bind-mount 权限问题的典型现场：容器内身份（由 entrypoint.sh 按挂载目录属主
+		// 解析）对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
 		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
 		if errors.Is(err, fs.ErrPermission) {
 			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。默认部署会按挂载目录属主" +
