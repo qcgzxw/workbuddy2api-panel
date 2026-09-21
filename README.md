@@ -650,6 +650,9 @@ http://127.0.0.1:7863/panel/
 #      直接 up -d 会复用旧镜像（旧 ENTRYPOINT/旧 USER），迁移永远不会发生：
 #        docker compose up -d --build
 #      确认：docker compose logs | grep 迁移     → 期望「已把旧 ./config.json 迁移到 ./data/config.json」
+#    ⚠️ 忘了 --build 的后果不止"迁移不发生"：旧镜像层里还带着示例配置 `api_key=test_key`
+#      （镜像内 `/app/config.json`），旧 ENTRYPOINT 也仍指向它 —— 服务会**静默地以这个公开密钥运行**，
+#      既不会打「已生成推荐配置」，也不会有空 key 告警。命令行 `docker compose logs | grep -i api_key` 可自检。
 #   3) 确认 ./data/config.json 里的 api_key 正确后，删除宿主 ./config.json 与那一行迁移挂载，再 up -d 一次
 
 # 方式二：手工迁移（在仓库根执行；随后**同样要 `docker compose up -d --build`** 才等价——

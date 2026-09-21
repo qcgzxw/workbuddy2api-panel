@@ -87,6 +87,12 @@ func main() {
 	if cfg.APIKey == "" && !isLoopbackListen(cfg.Listen) {
 		log.Printf("WARN: 未设置 api_key（空 = 不鉴权）且 %s 非回环监听：任何可达客户端都可调用。见 README「升级说明」", cfg.Listen)
 	}
+	// 示例占位符（config.example.json 的 api_key）绝不能在生产上生效：它意味着"旧镜像层里的示例配置"
+	// 被加载了（例如升级时忘了 --build、复用旧镜像），而旧镜像的 ENTRYPOINT 指向镜像内的 /app/config.json。
+	// 这条路径**不会**触发「已生成推荐配置」（文件存在）与空 key 告警（key 非空），所以需要独立一条。
+	if cfg.APIKey == "test_key" {
+		log.Printf("WARN: api_key 仍是示例占位符 test_key —— 当前加载的极可能是镜像内置的示例配置（升级时忘了 `docker compose up -d --build`？）。任何知道该公开值的人都可调用本网关，请立即修正。")
+	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {

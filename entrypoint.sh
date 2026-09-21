@@ -2,14 +2,16 @@
 # entrypoint.sh — 解析运行身份 → 必要时对齐挂载目录属主 → su-exec 降权启动。
 #
 # 设计要点（见 docs/superpowers/specs/2026-09-21-docker-config-save-design.md）：
-#   * 容器默认以 root 启动、解析身份后降权；app 进程始终非 root（降权后无 capabilities）。
+#   * 容器默认以 root 启动、解析身份后降权；app 进程始终非 root（降权后无 capabilities），
+#     唯一例外是显式 PUID=0 的逃生门。
 #   * 仅当"顶层挂载目录/配置文件属主"与目标身份不符时才 chown，每次动作留日志痕。
 #   * 配置固定落在目录挂载内（默认 /app/data/config.json）。单文件挂载会让
 #     rename 覆盖挂载点失败（EBUSY），tmp+rename 的原子替换就不成立。
 set -eu
 
 CONFIG="${WB2A_CONFIG:-/app/data/config.json}"
-export WB2A_CONFIG="$CONFIG"          # login.sh 等容器内脚本共用同一路径来源
+export WB2A_CONFIG="$CONFIG"          # 供 login.sh 等容器内脚本参考；注意 `docker exec` 不继承 PID-1 的 export，
+                                       # 脚本侧另有相对路径（data/config.json）回落，不依赖此变量
 
 # 命令解析：无参 → 默认命令；首参形如 -xxx → 当作二进制的参数追加到默认命令后。
 # （旧 ENTRYPOINT 自带 -config，`docker run <img> --listen :8080` 本来是能用的，
