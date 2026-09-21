@@ -32,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.2-panel"
+const appVersion = "1.11.3-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -113,6 +113,12 @@ func main() {
 	p.SetStore(store)
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
+
+	// auths 目录热加载：运行中新增/刷新的凭证自动进池，免手动重启。面板登录路径自带
+	// pool.Add，本监听补的是**目录侧**写入（login.sh 落盘、手工拷文件）。停止函数比上方
+	// defer(p.Close) 晚注册 → 停机时先执行：先停监听再关池，避免关池后仍触发一次对齐。
+	stopAuthWatch := p.StartAuthDirWatch(cfg.AuthDir)
+	defer stopAuthWatch()
 
 	// 熔断器 + 在途上限（含 global 分档）+ 连败降权 + 三因子加权调优（从 config 注入，
 	// 非正值回退默认）。
