@@ -117,7 +117,7 @@
        GrantedAt   string // 如 "2026-09-22T11:40:00+08:00"
    }
    ```
-   Telegram Markdown 模板设计：
+   Telegram MarkdownV2 模板设计（API 请求载荷中设置 `"parse_mode": "MarkdownV2"`）：
    ```markdown
    🎉 *WorkBuddy 抽奖中奖提醒*
 
@@ -127,7 +127,7 @@
    ⏳ *有效期*：%s
    📅 *时间*：%s
    ```
-   - **转义防御**：在动态拼接 `DisplayName` 与 `PrizeName` 前，对 Markdown 特殊字符（如 `_`, `*`, `[`, `]`, `(`, `)`, `~`, `` ` ``, `>`, `#`, `+`, `-`, `=`, `|`, `{`, `}`, `.`, `!`）进行转义处理（`escapeMarkdown(s)`），防止触发 Telegram API 400 Bad Request。
+   - **转义防御**：在动态拼接 `DisplayName` 与 `PrizeName` 前，对 MarkdownV2 特殊字符（如 `_`, `*`, `[`, `]`, `(`, `)`, `~`, `` ` ``, `>`, `#`, `+`, `-`, `=`, `|`, `{`, `}`, `.`, `!`）进行转义处理（`escapeMarkdownV2(s)`），防止触发 Telegram API 400 Bad Request。
    - **错误处理**：`SendVoucherWon` 在 HTTP 返回非 2xx 或网络错误时返回具体的 `error`，由调用方感知发送结果，不成功则不置位 `notified`。
 
 ### 3.3 券码本地状态管理模块 (`internal/voucher`)
@@ -189,6 +189,7 @@
        ```
    - **写盘与无死锁设计**：
      - 重构出内部 `saveAtomicLocked()`（假设已持 `a.mu`），公有 `SaveAtomic()` 内部加锁后调用 `saveAtomicLocked()`；
+     - 写盘时，仅在 `a.Remark != ""` 时向 `account` 映射写入 `"remark": a.Remark`（避免在无备注凭据中产生冗余空键）；
      - 新增方法 `SetRemark(remark string) error`：
        ```go
        func (a *Auth) SetRemark(remark string) error {
@@ -244,6 +245,7 @@
 
 3. **依赖装配与初始化 (`cmd/server/main.go` & `config.go`)**：
    - `Config` 中新增 `Telegram notify.Config` 与 `VoucherFile string`；
+   - `restartRequiredFields()` 中加入 `"telegram"` 和 `"voucher_file"`，确保面板修改配置时正确提示需重启生效；
    - `main.go` 中初始化 `voucher.NewStore(cfg.VoucherFile)` 与 `notify.NewNotifier(cfg.Telegram)`；
    - 将实例按依赖注入方式分别传给 `scheduler.Config` 与 `panel.Config`。
 
