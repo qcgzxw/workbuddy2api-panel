@@ -81,7 +81,7 @@ func (s *Scheduler) schoolAccount(a *auth.Auth) {
 		prize, err := s.cfg.Upstream.SchoolDraw(a)
 		if err != nil {
 			log.Printf("school %s: draw: %v", logfmt.Label(a.UID, a.Nickname), err)
-			return
+			break
 		}
 		log.Printf("school %s: 🎲 %s", logfmt.Label(a.UID, a.Nickname), prize)
 		time.Sleep(schoolDrawDelay)
@@ -107,7 +107,9 @@ func (s *Scheduler) checkAndNotifyVouchers(a *auth.Auth, vouchers []upstream.Sch
 	}
 	displayName := a.DisplayName()
 	if s.cfg.Notifier == nil || !s.cfg.Notifier.Enabled() {
-		_ = s.cfg.VoucherStore.MarkNotified(a.UID, displayName, unnotified)
+		if err := s.cfg.VoucherStore.MarkNotified(a.UID, displayName, unnotified); err != nil {
+			log.Printf("school %s: mark silent notified error: %v", logfmt.Label(a.UID, displayName), err)
+		}
 		return
 	}
 
@@ -129,7 +131,9 @@ func (s *Scheduler) checkAndNotifyVouchers(a *auth.Auth, vouchers []upstream.Sch
 		}
 	}
 	if len(successList) > 0 {
-		_ = s.cfg.VoucherStore.MarkNotified(a.UID, displayName, successList)
+		if err := s.cfg.VoucherStore.MarkNotified(a.UID, displayName, successList); err != nil {
+			log.Printf("school %s: mark notified error: %v", logfmt.Label(a.UID, displayName), err)
+		}
 	}
 }
 
