@@ -442,6 +442,10 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
+  telegram_enabled: ['telegram', 'enabled'],
+  telegram_bot_token: ['telegram', 'bot_token'],
+  telegram_chat_id: ['telegram', 'chat_id'],
+  voucher_file: ['voucher_file'],
 };
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -518,6 +522,41 @@ $('btnEye').onclick = () => {
   el.type = show ? 'text' : 'password';
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
+const btnTgEye = $('btnTgEye');
+if (btnTgEye) {
+  btnTgEye.onclick = () => {
+    const el = $('cfgTgToken');
+    if (!el) return;
+    const show = el.type === 'password';
+    el.type = show ? 'text' : 'password';
+    btnTgEye.textContent = show ? '隐藏' : '显示';
+  };
+}
+const btnTgTest = $('btnTgTest');
+if (btnTgTest) {
+  btnTgTest.onclick = async () => {
+    const token = ($('cfgTgToken')?.value || '').trim();
+    const chat = ($('cfgTgChat')?.value || '').trim();
+    if (!token || !chat) {
+      toast('请先填写 Bot Token 与 Chat ID', 'err');
+      return;
+    }
+    btnTgTest.disabled = true;
+    btnTgTest.textContent = '发送中…';
+    try {
+      await api('telegram/test', {
+        method: 'POST',
+        body: { bot_token: token, chat_id: chat }
+      });
+      toast('测试消息已发送，请在 Telegram 中查收！', 'ok');
+    } catch (e) {
+      toast('发送失败：' + e.message, 'err');
+    } finally {
+      btnTgTest.disabled = false;
+      btnTgTest.textContent = '发送测试消息';
+    }
+  };
+}
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();

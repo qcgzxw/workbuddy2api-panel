@@ -2,9 +2,11 @@ package notify
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -296,3 +298,85 @@ func TestSendVoucherApiBaseTrailingSlash(t *testing.T) {
 		t.Errorf("expected path /bottok/sendMessage, got %s", requestedPath)
 	}
 }
+
+func TestReconfigureAndSendTestMessage(t *testing.T) {
+	var receivedBody map[string]any
+	var receivedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	n := NewNotifier(Config{Enabled: false})
+	if n.Enabled() {
+		t.Errorf("expected disabled initially")
+	}
+
+	// Reconfigure to enabled
+	n.Reconfigure(Config{
+		Enabled:  true,
+		BotToken: "initial-token",
+		ChatID:   "initial-chat",
+	})
+	if !n.Enabled() {
+		t.Errorf("expected enabled after reconfigure")
+	}
+	cfg := n.Config()
+	if cfg.BotToken != "initial-token" || cfg.ChatID != "initial-chat" {
+		t.Errorf("unexpected config: %+v", cfg)
+	}
+
+	n.apiBase = srv.URL
+
+	// 1. SendTestMessage using notifier's own credentials
+	if err := n.SendTestMessage("", ""); err != nil {
+		t.Fatalf("SendTestMessage failed: %v", err)
+	}
+	if receivedPath != "/botinitial-token/sendMessage" {
+		t.Errorf("expected path /botinitial-token/sendMessage, got %s", receivedPath)
+	}
+	if receivedBody["chat_id"] != "initial-chat" {
+		t.Errorf("expected chat_id initial-chat, got %v", receivedBody["chat_id"])
+	}
+
+	// 2. SendTestMessage overriding with custom credentials
+	if err := n.SendTestMessage("custom-token", "custom-chat"); err != nil {
+		t.Fatalf("SendTestMessage with custom credentials failed: %v", err)
+	}
+	if receivedPath != "/botcustom-token/sendMessage" {
+		t.Errorf("expected path /botcustom-token/sendMessage, got %s", receivedPath)
+	}
+	if receivedBody["chat_id"] != "custom-chat" {
+		t.Errorf("expected chat_id custom-chat, got %v", receivedBody["chat_id"])
+	}
+
+	// 3. SendTestMessage with empty credentials on empty notifier
+	emptyNotifier := NewNotifier(Config{})
+	if err := emptyNotifier.SendTestMessage("", ""); err == nil {
+		t.Errorf("expected error when credentials are empty")
+	}
+
+	// 4. Concurrency test for race detection
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(idx int) {
+			defer wg.Done()
+			n.Reconfigure(Config{
+				Enabled:  idx%2 == 0,
+				BotToken: fmt.Sprintf("tok-%d", idx),
+				ChatID:   fmt.Sprintf("chat-%d", idx),
+			})
+		}(i)
+		go func() {
+			defer wg.Done()
+			_ = n.Enabled()
+			_ = n.Config()
+		}()
+	}
+	wg.Wait()
+}
+

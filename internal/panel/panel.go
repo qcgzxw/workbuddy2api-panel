@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -191,6 +192,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("POST /panel/api/telegram/test", p.withAuth(p.telegramTest))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -507,6 +509,54 @@ func (p *Panel) accountRemark(w http.ResponseWriter, r *http.Request) {
 		"uid":          uid,
 		"remark":       a.RemarkValue(),
 		"display_name": a.DisplayName(),
+	})
+}
+
+// telegramTest 发送测试消息到 Telegram。
+func (p *Panel) telegramTest(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		BotToken string `json:"bot_token"`
+		ChatID   string `json:"chat_id"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&body)
+	}
+
+	botToken := strings.TrimSpace(body.BotToken)
+	chatID := strings.TrimSpace(body.ChatID)
+
+	var notifier *notify.Notifier
+	if p.notifier != nil {
+		notifier = p.notifier
+	} else {
+		notifier = notify.NewNotifier(notify.Config{})
+	}
+
+	if botToken == "" || chatID == "" {
+		cur := notifier.Config()
+		if botToken == "" {
+			botToken = cur.BotToken
+		}
+		if chatID == "" {
+			chatID = cur.ChatID
+		}
+	}
+
+	if botToken == "" || chatID == "" {
+		writeErr(w, http.StatusBadRequest, "请先填写 Bot Token 与 Chat ID")
+		return
+	}
+
+	if err := notifier.SendTestMessage(botToken, chatID); err != nil {
+		log.Printf("panel: telegram test notification failed: %v", err)
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	log.Printf("panel: telegram test notification sent successfully (chat_id=%s)", chatID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"message": "测试消息已发送，请在 Telegram 中查收",
 	})
 }
 

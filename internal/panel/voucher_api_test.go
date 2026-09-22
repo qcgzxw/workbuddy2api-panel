@@ -427,3 +427,135 @@ func TestCheckAndNotifyVouchersSilentWhenDisabled(t *testing.T) {
 		t.Errorf("expected 0 unnotified vouchers after silent mark, got %d", len(unnotified))
 	}
 }
+
+func TestTelegramTestAPI(t *testing.T) {
+	var requestedPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	n := notify.NewNotifier(notify.Config{
+		Enabled:  true,
+		BotToken: "default-token",
+		ChatID:   "default-chat",
+	})
+	n.SetAPIBase(srv.URL)
+
+	pn := New(Config{
+		Notifier: n,
+		APIKey:   "testkey",
+	})
+
+	// 1. Missing credentials: empty body and empty notifier
+	emptyPanel := New(Config{APIKey: "testkey"})
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/telegram/test", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Authorization", "Bearer testkey")
+	w := httptest.NewRecorder()
+	emptyPanel.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty credentials, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. Success with mock server via panel's configured notifier
+	req2 := httptest.NewRequest(http.MethodPost, "/panel/api/telegram/test", bytes.NewReader([]byte(`{}`)))
+	req2.Header.Set("Authorization", "Bearer testkey")
+	w2 := httptest.NewRecorder()
+	pn.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+	if requestedPath != "/botdefault-token/sendMessage" {
+		t.Errorf("expected /botdefault-token/sendMessage, got %s", requestedPath)
+	}
+
+	// 3. Success with request body override
+	mockReqBody := map[string]string{
+		"bot_token": "custom-token",
+		"chat_id":   "custom-chat",
+	}
+	mockBytes, _ := json.Marshal(mockReqBody)
+	req3 := httptest.NewRequest(http.MethodPost, "/panel/api/telegram/test", bytes.NewReader(mockBytes))
+	req3.Header.Set("Authorization", "Bearer testkey")
+	w3 := httptest.NewRecorder()
+	pn.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Errorf("expected 200 with override, got %d: %s", w3.Code, w3.Body.String())
+	}
+	if requestedPath != "/botcustom-token/sendMessage" {
+		t.Errorf("expected /botcustom-token/sendMessage, got %s", requestedPath)
+	}
+}
+
+func TestConfigTelegramSaveAndReconfigure(t *testing.T) {
+	tgNotifier := notify.NewNotifier(notify.Config{
+		Enabled:  false,
+		BotToken: "",
+		ChatID:   "",
+	})
+
+	var savedPayload []byte
+	pn := New(Config{
+		APIKey:   "testkey",
+		Notifier: tgNotifier,
+		LoadConfig: func() (any, error) {
+			return map[string]any{
+				"telegram": map[string]any{
+					"enabled":   false,
+					"bot_token": "",
+					"chat_id":   "",
+				},
+			}, nil
+		},
+		SaveConfig: func(raw []byte) ([]string, error) {
+			savedPayload = raw
+			var incoming struct {
+				Telegram notify.Config `json:"telegram"`
+			}
+			_ = json.Unmarshal(raw, &incoming)
+			tgNotifier.Reconfigure(incoming.Telegram)
+			return []string{}, nil
+		},
+	})
+
+	// 1. GET /panel/api/config
+	reqGet := httptest.NewRequest(http.MethodGet, "/panel/api/config", nil)
+	reqGet.Header.Set("Authorization", "Bearer testkey")
+	wGet := httptest.NewRecorder()
+	pn.ServeHTTP(wGet, reqGet)
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("GET /panel/api/config failed: %d", wGet.Code)
+	}
+
+	// 2. POST /panel/api/config
+	postBody := map[string]any{
+		"telegram": map[string]any{
+			"enabled":   true,
+			"bot_token": "new-token",
+			"chat_id":   "new-chat",
+		},
+	}
+	bodyBytes, _ := json.Marshal(postBody)
+	reqPost := httptest.NewRequest(http.MethodPost, "/panel/api/config", bytes.NewReader(bodyBytes))
+	reqPost.Header.Set("Authorization", "Bearer testkey")
+	wPost := httptest.NewRecorder()
+	pn.ServeHTTP(wPost, reqPost)
+
+	if wPost.Code != http.StatusOK {
+		t.Fatalf("POST /panel/api/config failed: %d: %s", wPost.Code, wPost.Body.String())
+	}
+	if !strings.Contains(string(savedPayload), "new-token") {
+		t.Errorf("savedPayload missing new-token: %s", string(savedPayload))
+	}
+	if !tgNotifier.Enabled() {
+		t.Errorf("expected tgNotifier to be enabled after reconfigure")
+	}
+	cfg := tgNotifier.Config()
+	if cfg.BotToken != "new-token" || cfg.ChatID != "new-chat" {
+		t.Errorf("unexpected tgNotifier config: %+v", cfg)
+	}
+}
+
+

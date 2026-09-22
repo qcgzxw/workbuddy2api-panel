@@ -801,15 +801,12 @@ func TestRestartRequiredFieldsVoucherAndTelegram(t *testing.T) {
 		t.Error("expected voucher_file in restartRequiredFields")
 	}
 
+	// Telegram is hot-reconfigured via tg.Reconfigure, so it does not require restart.
 	c.Telegram.Enabled = true
 	fields = restartRequiredFields(c)
-	hasTelegram := false
 	for _, f := range fields {
 		if f == "telegram" {
-			hasTelegram = true
+			t.Error("telegram is hot-reconfigured and should not be in restartRequiredFields")
 		}
-	}
-	if !hasTelegram {
-		t.Error("expected telegram in restartRequiredFields")
 	}
 }

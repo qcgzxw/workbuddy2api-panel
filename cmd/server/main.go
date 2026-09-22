@@ -293,7 +293,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, tgNotifier)
 		},
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
@@ -387,14 +387,15 @@ func isLoopbackListen(addr string) bool {
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
+//   - telegram.* → tg.Reconfigure（热生效，无需重启）
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
-//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
+//   - listen / auth_dir / state_file / voucher_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
 //
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, tg *notify.Notifier) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -444,6 +445,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	if tg != nil {
+		tg.Reconfigure(newCfg.Telegram)
+	}
 
 	return restartRequiredFields(newCfg), nil
 }
@@ -464,9 +468,6 @@ func restartRequiredFields(c *Config) []string {
 	}
 	if c.VoucherFile != "" {
 		out = append(out, "voucher_file")
-	}
-	if c.Telegram.Enabled || c.Telegram.BotToken != "" || c.Telegram.ChatID != "" {
-		out = append(out, "telegram")
 	}
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {

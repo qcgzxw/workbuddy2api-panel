@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,6 +31,7 @@ type VoucherWonEvent struct {
 
 // Notifier sends notification messages to Telegram.
 type Notifier struct {
+	mu      sync.RWMutex
 	cfg     Config
 	client  *http.Client
 	apiBase string
@@ -46,9 +48,44 @@ func NewNotifier(cfg Config) *Notifier {
 	}
 }
 
+// Config returns a copy of current configuration in a thread-safe manner.
+func (n *Notifier) Config() Config {
+	if n == nil {
+		return Config{}
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.cfg
+}
+
+// Reconfigure updates notifier configuration in a thread-safe manner.
+func (n *Notifier) Reconfigure(cfg Config) {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.cfg = cfg
+}
+
+// SetAPIBase sets a custom Telegram API base URL (primarily for testing).
+func (n *Notifier) SetAPIBase(base string) {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.apiBase = base
+}
+
 // Enabled reports whether Telegram notification is enabled and configured.
 func (n *Notifier) Enabled() bool {
-	return n != nil && n.cfg.Enabled && n.cfg.BotToken != "" && n.cfg.ChatID != ""
+	if n == nil {
+		return false
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.cfg.Enabled && n.cfg.BotToken != "" && n.cfg.ChatID != ""
 }
 
 // escapeMarkdownV2 escapes all Telegram MarkdownV2 reserved characters:
@@ -92,6 +129,8 @@ func (n *Notifier) SendVoucherWon(evt VoucherWonEvent) error {
 		return nil
 	}
 
+	cfg := n.Config()
+
 	validTo := evt.ValidTo
 	if validTo == "" {
 		validTo = "长期有效"
@@ -119,8 +158,37 @@ func (n *Notifier) SendVoucherWon(evt VoucherWonEvent) error {
 		grantedAt,
 	)
 
+	return n.sendRaw(cfg.BotToken, cfg.ChatID, text)
+}
+
+// SendTestMessage sends a test notification with given credentials, or notifier's current config if omitted.
+func (n *Notifier) SendTestMessage(botToken, chatID string) error {
+	if n == nil {
+		return fmt.Errorf("telegram notifier not initialized")
+	}
+	cur := n.Config()
+	if botToken == "" {
+		botToken = cur.BotToken
+	}
+	if chatID == "" {
+		chatID = cur.ChatID
+	}
+	botToken = strings.TrimSpace(botToken)
+	chatID = strings.TrimSpace(chatID)
+	if botToken == "" || chatID == "" {
+		return fmt.Errorf("bot_token and chat_id are required")
+	}
+
+	text := fmt.Sprintf(
+		"🎉 *WorkBuddy 抽奖中奖提醒（测试推送）*\n\n这是一条测试消息，验证您的 Telegram Bot 与 Chat ID 配置正常。\n当系统自动抽奖中奖时，券码将通过此通知渠道实时推送。\n\n📅 *测试时间*：%s",
+		escapeMarkdownV2(time.Now().Format("2006-01-02 15:04:05")),
+	)
+	return n.sendRaw(botToken, chatID, text)
+}
+
+func (n *Notifier) sendRaw(botToken, chatID, text string) error {
 	payloadBytes, err := json.Marshal(telegramSendMessageReq{
-		ChatID:    n.cfg.ChatID,
+		ChatID:    chatID,
 		Text:      text,
 		ParseMode: "MarkdownV2",
 	})
@@ -139,7 +207,7 @@ func (n *Notifier) SendVoucherWon(evt VoucherWonEvent) error {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 
-	url := fmt.Sprintf("%s/bot%s/sendMessage", apiBase, n.cfg.BotToken)
+	url := fmt.Sprintf("%s/bot%s/sendMessage", apiBase, botToken)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("create telegram request: %w", err)
@@ -149,8 +217,8 @@ func (n *Notifier) SendVoucherWon(evt VoucherWonEvent) error {
 	resp, err := client.Do(req)
 	if err != nil {
 		errMsg := err.Error()
-		if n.cfg.BotToken != "" {
-			errMsg = strings.ReplaceAll(errMsg, n.cfg.BotToken, "***")
+		if botToken != "" {
+			errMsg = strings.ReplaceAll(errMsg, botToken, "***")
 		}
 		return fmt.Errorf("execute telegram request: %s", errMsg)
 	}
