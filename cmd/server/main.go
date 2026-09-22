@@ -198,6 +198,8 @@ func main() {
 	tgNotifier := notify.NewNotifier(cfg.Telegram)
 	if tgNotifier.Enabled() {
 		log.Printf("[notify] Telegram 抽奖中奖推送已启用 (chat_id=%s)", cfg.Telegram.ChatID)
+	} else if cfg.Telegram.Enabled {
+		log.Printf("[notify] 警告: Telegram 已启用但缺少 bot_token 或 chat_id，推送未激活")
 	}
 
 	sch := scheduler.New(scheduler.Config{

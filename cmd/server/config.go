@@ -321,6 +321,17 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_VOUCHER_FILE"); v != "" {
 		c.VoucherFile = v
 	}
+	if v := os.Getenv("WB2A_TELEGRAM_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Telegram.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_TELEGRAM_BOT_TOKEN"); v != "" {
+		c.Telegram.BotToken = v
+	}
+	if v := os.Getenv("WB2A_TELEGRAM_CHAT_ID"); v != "" {
+		c.Telegram.ChatID = v
+	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -466,9 +477,12 @@ func (c *Config) normalize() error {
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
 	}
-	if strings.TrimSpace(c.VoucherFile) == "" {
+	c.VoucherFile = strings.TrimSpace(c.VoucherFile)
+	if c.VoucherFile == "" {
 		c.VoucherFile = "./data/vouchers.json"
 	}
+	c.Telegram.BotToken = strings.TrimSpace(c.Telegram.BotToken)
+	c.Telegram.ChatID = strings.TrimSpace(c.Telegram.ChatID)
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。
 	if len(c.Schedule.CheckinHours) == 0 {

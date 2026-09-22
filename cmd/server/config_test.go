@@ -762,6 +762,22 @@ func TestVoucherAndTelegramConfig(t *testing.T) {
 	if !loaded.Telegram.Enabled || loaded.Telegram.BotToken != "123:ABC" || loaded.Telegram.ChatID != "456" {
 		t.Errorf("Telegram=%+v want enabled with token and chat_id", loaded.Telegram)
 	}
+
+	// Env overrides
+	t.Setenv("WB2A_VOUCHER_FILE", "./env/vouchers.json")
+	t.Setenv("WB2A_TELEGRAM_ENABLED", "false")
+	t.Setenv("WB2A_TELEGRAM_BOT_TOKEN", "env-token")
+	t.Setenv("WB2A_TELEGRAM_CHAT_ID", "env-chat")
+	envLoaded, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envLoaded.VoucherFile != "./env/vouchers.json" {
+		t.Errorf("VoucherFile=%q want ./env/vouchers.json from env", envLoaded.VoucherFile)
+	}
+	if envLoaded.Telegram.Enabled != false || envLoaded.Telegram.BotToken != "env-token" || envLoaded.Telegram.ChatID != "env-chat" {
+		t.Errorf("Telegram=%+v want env overrides applied", envLoaded.Telegram)
+	}
 }
 
 func TestRestartRequiredFieldsVoucherAndTelegram(t *testing.T) {
@@ -797,4 +813,3 @@ func TestRestartRequiredFieldsVoucherAndTelegram(t *testing.T) {
 		t.Error("expected telegram in restartRequiredFields")
 	}
 }
-
