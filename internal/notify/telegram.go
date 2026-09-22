@@ -52,13 +52,27 @@ func (n *Notifier) Enabled() bool {
 }
 
 // escapeMarkdownV2 escapes all Telegram MarkdownV2 reserved characters:
-// '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'
+// '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\'
 func escapeMarkdownV2(s string) string {
 	var sb strings.Builder
 	sb.Grow(len(s) + 16)
 	for _, r := range s {
 		switch r {
-		case '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!':
+		case '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\':
+			sb.WriteByte('\\')
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
+// escapeMarkdownCode escapes '\' and '`' within Telegram MarkdownV2 inline code and pre blocks.
+func escapeMarkdownCode(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s) + 4)
+	for _, r := range s {
+		switch r {
+		case '`', '\\':
 			sb.WriteByte('\\')
 		}
 		sb.WriteRune(r)
@@ -90,11 +104,17 @@ func (n *Notifier) SendVoucherWon(evt VoucherWonEvent) error {
 	}
 	grantedAt = escapeMarkdownV2(grantedAt)
 
+	code := evt.Code
+	if code == "" {
+		code = "-"
+	}
+	code = escapeMarkdownCode(code)
+
 	text := fmt.Sprintf(
 		"🎉 *WorkBuddy 抽奖中奖提醒*\n\n🎁 *奖品*：%s\n👤 *账号*：%s\n🎟️ *券码*：`%s`\n⏳ *有效期*：%s\n📅 *时间*：%s",
 		escapeMarkdownV2(evt.PrizeName),
 		escapeMarkdownV2(evt.DisplayName),
-		evt.Code,
+		code,
 		validTo,
 		grantedAt,
 	)
@@ -112,6 +132,7 @@ func (n *Notifier) SendVoucherWon(evt VoucherWonEvent) error {
 	if apiBase == "" {
 		apiBase = "https://api.telegram.org"
 	}
+	apiBase = strings.TrimRight(apiBase, "/")
 
 	client := n.client
 	if client == nil {
@@ -127,11 +148,19 @@ func (n *Notifier) SendVoucherWon(evt VoucherWonEvent) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("execute telegram request: %w", err)
+		errMsg := err.Error()
+		if n.cfg.BotToken != "" {
+			errMsg = strings.ReplaceAll(errMsg, n.cfg.BotToken, "***")
+		}
+		return fmt.Errorf("execute telegram request: %s", errMsg)
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return fmt.Errorf("read telegram response body: %w", err)
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("WARN: telegram sendMessage failed: status=%d body=%s", resp.StatusCode, string(respBody))
 		return fmt.Errorf("telegram sendMessage status %d: %s", resp.StatusCode, string(respBody))
@@ -141,7 +170,10 @@ func (n *Notifier) SendVoucherWon(evt VoucherWonEvent) error {
 		OK          bool   `json:"ok"`
 		Description string `json:"description"`
 	}
-	if err := json.Unmarshal(respBody, &tgResp); err == nil && !tgResp.OK {
+	if err := json.Unmarshal(respBody, &tgResp); err != nil {
+		return fmt.Errorf("unmarshal telegram response: %w", err)
+	}
+	if !tgResp.OK {
 		log.Printf("WARN: telegram sendMessage ok=false: %s", tgResp.Description)
 		return fmt.Errorf("telegram sendMessage failed: %s", tgResp.Description)
 	}
