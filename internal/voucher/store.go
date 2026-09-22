@@ -1,10 +1,12 @@
 package voucher
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,6 +49,10 @@ type Store struct {
 
 // NewStore 创建或从本地文件加载券码存储。
 func NewStore(filePath string) (*Store, error) {
+	if strings.TrimSpace(filePath) == "" {
+		return nil, errors.New("empty file path")
+	}
+
 	s := &Store{
 		filePath: filePath,
 		data: StoreData{
@@ -68,7 +74,7 @@ func NewStore(filePath string) (*Store, error) {
 		return nil, err
 	}
 
-	if len(content) > 0 {
+	if len(bytes.TrimSpace(content)) > 0 {
 		if err := json.Unmarshal(content, &s.data); err != nil {
 			return nil, err
 		}
@@ -102,7 +108,11 @@ func (s *Store) saveAtomicLocked() error {
 		return err
 	}
 
-	return os.Rename(tmpPath, s.filePath)
+	if err := os.Rename(tmpPath, s.filePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 // IsUsed 查询券码是否标记为已使用。
@@ -122,11 +132,20 @@ func (s *Store) SetUsed(code string, isUsed bool, uid, nickname, prizeName, vali
 	if s == nil {
 		return errors.New("voucher store is nil")
 	}
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return errors.New("empty voucher code")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, ok := s.data.Vouchers[code]
-	if !ok {
+	rec, existed := s.data.Vouchers[code]
+	var oldRec VoucherRecord
+	if existed {
+		oldRec = *rec
+	}
+
+	if !existed {
 		rec = &VoucherRecord{
 			Code:      code,
 			UID:       uid,
@@ -158,7 +177,15 @@ func (s *Store) SetUsed(code string, isUsed bool, uid, nickname, prizeName, vali
 		rec.UsedAt = nil
 	}
 
-	return s.saveAtomicLocked()
+	if err := s.saveAtomicLocked(); err != nil {
+		if existed {
+			*rec = oldRec
+		} else {
+			delete(s.data.Vouchers, code)
+		}
+		return err
+	}
+	return nil
 }
 
 // FilterUnnotified 过滤出未通知过的券码列表。
@@ -191,10 +218,20 @@ func (s *Store) MarkNotified(uid, nickname string, vouchers []upstream.SchoolVou
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	oldRecords := make(map[string]*VoucherRecord, len(vouchers))
+	newKeys := make([]string, 0, len(vouchers))
+
 	now := time.Now()
 	for _, v := range vouchers {
-		rec, ok := s.data.Vouchers[v.Code]
-		if !ok {
+		if strings.TrimSpace(v.Code) == "" {
+			continue
+		}
+		rec, existed := s.data.Vouchers[v.Code]
+		if existed {
+			oldCopy := *rec
+			oldRecords[v.Code] = &oldCopy
+		} else {
+			newKeys = append(newKeys, v.Code)
 			rec = &VoucherRecord{
 				Code:      v.Code,
 				GrantID:   v.GrantID,
@@ -204,28 +241,36 @@ func (s *Store) MarkNotified(uid, nickname string, vouchers []upstream.SchoolVou
 				ValidTo:   v.ValidTo,
 			}
 			s.data.Vouchers[v.Code] = rec
-		} else {
-			if rec.UID == "" && uid != "" {
-				rec.UID = uid
-			}
-			if rec.Nickname == "" && nickname != "" {
-				rec.Nickname = nickname
-			}
-			if rec.PrizeName == "" && v.PrizeName != "" {
-				rec.PrizeName = v.PrizeName
-			}
-			if rec.ValidTo == "" && v.ValidTo != "" {
-				rec.ValidTo = v.ValidTo
-			}
-			if rec.GrantID == 0 && v.GrantID != 0 {
-				rec.GrantID = v.GrantID
-			}
+		}
+		if rec.UID == "" && uid != "" {
+			rec.UID = uid
+		}
+		if rec.Nickname == "" && nickname != "" {
+			rec.Nickname = nickname
+		}
+		if rec.PrizeName == "" && v.PrizeName != "" {
+			rec.PrizeName = v.PrizeName
+		}
+		if rec.ValidTo == "" && v.ValidTo != "" {
+			rec.ValidTo = v.ValidTo
+		}
+		if rec.GrantID == 0 && v.GrantID != 0 {
+			rec.GrantID = v.GrantID
 		}
 		rec.Notified = true
 		rec.NotifiedAt = &now
 	}
 
-	return s.saveAtomicLocked()
+	if err := s.saveAtomicLocked(); err != nil {
+		for code, oldRec := range oldRecords {
+			*s.data.Vouchers[code] = *oldRec
+		}
+		for _, key := range newKeys {
+			delete(s.data.Vouchers, key)
+		}
+		return err
+	}
+	return nil
 }
 
 // Enrich 为上游券码附加本地使用状态。

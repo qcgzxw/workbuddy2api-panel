@@ -163,3 +163,46 @@ func TestStoreFileHandling(t *testing.T) {
 		t.Errorf("expected error when loading invalid json file")
 	}
 }
+
+func TestStoreValidationAndRollback(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. 空路径校验
+	if _, err := NewStore("   "); err == nil {
+		t.Errorf("expected error for empty file path")
+	}
+
+	dataFile := filepath.Join(tmpDir, "store.json")
+	s, err := NewStore(dataFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. 空券码校验
+	if err := s.SetUsed("  ", true, "u", "n", "p", "v"); err == nil {
+		t.Errorf("expected error for empty voucher code")
+	}
+
+	// 3. 落盘失败回滚验证
+	// 初始化一张正常券
+	if err := s.SetUsed("V1", false, "u", "n", "p", "v"); err != nil {
+		t.Fatal(err)
+	}
+	// 将文件路径改为指向一个非法目标（如已存在的目录），使 rename/write 报错
+	s.filePath = tmpDir // 目录路径无法作为普通文件写入
+	if err := s.SetUsed("V1", true, "u", "n", "p", "v"); err == nil {
+		t.Errorf("expected write failure when filePath is a directory")
+	}
+	// 验证内存状态回滚为原有的 IsUsed=false
+	if s.IsUsed("V1") {
+		t.Errorf("expected V1 IsUsed to remain false after failed SetUsed")
+	}
+
+	// 测试 MarkNotified 回滚
+	if err := s.MarkNotified("u", "n", []upstream.SchoolVoucher{{Code: "V2"}}); err == nil {
+		t.Errorf("expected error for failed MarkNotified")
+	}
+	if s.data.Vouchers["V2"] != nil {
+		t.Errorf("expected V2 to be deleted from map after failed MarkNotified")
+	}
+}
