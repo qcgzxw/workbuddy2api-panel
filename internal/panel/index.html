@@ -348,6 +348,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 /* 过期态：只淡标题与元信息（保持券码可读），边框改虚线示意作废 */
 .vc.expired { border-style: dashed; }
 .vc.expired .hd, .vc.expired .meta { opacity: .55; }
+.vc.used { opacity: .65; }
+.vc.used code { text-decoration: line-through; color: var(--ink-3); }
+#vcBody.hide-used .vc.used { display: none !important; }
+.tag.muted { background: var(--bg-card); color: var(--ink-3); border: 1px solid var(--line); }
+.remark-badge { cursor: pointer; padding: 2px 6px; font-size: 11px; border-radius: 6px; background: var(--bg-card); border: 1px solid var(--line); color: var(--ink-2); display: inline-flex; align-items: center; gap: 3px; }
+.remark-badge:hover { border-color: var(--accent); }
 
 /* ── Toast ───────────────────────────────────────────────────────── */
 #toasts { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
@@ -849,7 +855,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div class="veil" id="vcVeil">
   <div class="dlg">
     <header>
-      <h3>开学季 · 我的券码</h3>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <h3>开学季 · 我的券码</h3>
+        <label class="check-inline" style="font-size:12px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="chkHideUsed"> 隐藏已使用
+        </label>
+      </div>
       <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应app/小程序兑换。</div>
     </header>
     <div class="body" id="vcBody"></div>

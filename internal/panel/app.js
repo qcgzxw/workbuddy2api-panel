@@ -35,8 +35,13 @@ async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
   const k = localStorage.getItem(LS_KEY);
   if (k) h['Authorization'] = 'Bearer ' + k;
-  if (opts.body) h['Content-Type'] = 'application/json';
-  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
+  const init = Object.assign({}, opts);
+  if (init.body != null && typeof init.body === 'object' && !(init.body instanceof FormData) && !(init.body instanceof Blob)) {
+    init.body = JSON.stringify(init.body);
+  }
+  if (init.body) h['Content-Type'] = 'application/json';
+  init.headers = h;
+  const r = await fetch('/panel/api/' + path, init);
   if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
@@ -188,9 +193,12 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    const remarkHtml = s.remark
+      ? '<span class="remark-badge" data-remark-edit="' + esc(s.uid) + '" title="点击修改备注">🏷️ ' + esc(s.remark) + '</span>'
+      : '<button class="xs ghost" data-remark-edit="' + esc(s.uid) + '" style="padding:1px 5px;font-size:11px;color:var(--ink-3);margin-left:4px">+备注</button>';
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + ' ' + remarkHtml + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -239,6 +247,26 @@ async function loadOverview(quiet) {
 }
 
 $('accBody').addEventListener('click', async ev => {
+  const bRem = ev.target.closest('[data-remark-edit]');
+  if (bRem) {
+    const uid = bRem.dataset.remarkEdit;
+    const acct = (overviewData?.accounts || []).find(x => x.uid === uid);
+    const oldVal = acct?.remark || '';
+    const val = prompt('输入账号文字备注 (留空则清除备注):', oldVal);
+    if (val === null) return;
+    try {
+      await api('accounts/' + encodeURIComponent(uid) + '/remark', {
+        method: 'POST',
+        body: { remark: val.trim() }
+      });
+      toast(val.trim() ? '备注已更新' : '备注已清除', 'ok');
+      loadOverview(true);
+    } catch (e) {
+      toast('修改备注失败: ' + e.message, 'err');
+    }
+    return;
+  }
+
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
@@ -1014,16 +1042,30 @@ function copyText(text) {
 
 function vcCard(v) {
   const expired = v.valid_to && new Date(v.valid_to) < new Date();
-  return '<div class="vc' + (expired ? ' expired' : '') + '">' +
+  const used = !!v.is_used;
+  let tagClass = 'ok';
+  let tagText = '可使用';
+  if (used) {
+    tagClass = 'muted';
+    tagText = '已使用';
+  } else if (expired) {
+    tagClass = 'bad';
+    tagText = '已过期';
+  }
+  return '<div class="vc' + (expired ? ' expired' : '') + (used ? ' used' : '') + '" data-code="' + esc(v.code || '') + '">' +
     '<div class="hd"><span class="nm">' + esc(v.prize_name || v.sku_code || '券') + '</span>' +
-    (expired ? '<span class="tag bad">已过期</span>' : '<span class="tag ok">可使用</span>') + '</div>' +
+    '<span class="tag ' + tagClass + '">' + tagText + '</span></div>' +
     '<div class="meta">' +
       (v.valid_to ? '有效期至 ' + esc(v.valid_to) : '长期有效') +
       (v.granted_at ? ' · ' + esc(v.granted_at.slice(0, 10)) + ' 抽中' : '') +
+      (used && v.used_at ? ' · ' + esc(v.used_at.slice(0, 10)) + ' 使用' : '') +
     '</div>' +
     '<div class="sep"></div>' +
     '<div class="ft"><span class="lab">券码</span><code>' + esc(v.code || '-') + '</code>' +
     '<span class="acts">' +
+      (v.code ? (used
+        ? '<button class="xs ghost" data-toggle-used="' + esc(v.code) + '" data-next="false">恢复未使用</button>'
+        : '<button class="xs ghost" data-toggle-used="' + esc(v.code) + '" data-next="true">标记已使用</button>') : '') +
       (v.code ? '<button class="xs ghost" data-qr="' + esc(v.code) + '">二维码</button>' : '') +
       '<button class="xs ghost" data-copy="' + esc(v.code || '') + '">复制</button>' +
     '</span></div>' +
@@ -1040,17 +1082,37 @@ async function loadSchoolVouchers() {
     const arr = d.accounts || [];
     const ok = arr.filter(a => !a.error);
     const total = ok.reduce((n, a) => n + (a.vouchers || []).length, 0);
+    const usedCount = ok.reduce((n, a) => n + (a.vouchers || []).filter(v => v.is_used).length, 0);
+    const availCount = total - usedCount;
     body.innerHTML = ok.filter(a => (a.vouchers || []).length).map(a =>
       '<div class="vc-acct"><span class="nm">' + esc(a.nickname || a.uid) + '</span>' +
       '<span>' + a.vouchers.length + ' 张</span></div>' +
       a.vouchers.map(vcCard).join('')
     ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
-    $('vcNote').textContent = total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '';
+    $('vcNote').textContent = total ? total + ' 张券（' + availCount + ' 张可用 · ' + usedCount + ' 张已使用）' : '';
+    const chkHide = $('chkHideUsed');
+    if (chkHide) $('vcBody').classList.toggle('hide-used', chkHide.checked);
     const errs = arr.filter(a => a.error);
     if (errs.length) {
       body.insertAdjacentHTML('beforeend', '<div class="note" style="color:var(--warn);margin-top:8px">查询失败：' +
         errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(a.error) + '）').join('、') + '</div>');
     }
+    body.querySelectorAll('button[data-toggle-used]').forEach(b => b.onclick = async () => {
+      const code = b.dataset.toggleUsed;
+      const isUsed = b.dataset.next === 'true';
+      b.disabled = true;
+      try {
+        await api('school/vouchers/status', {
+          method: 'POST',
+          body: { code: code, is_used: isUsed }
+        });
+        toast(isUsed ? '已标记为已使用' : '已恢复为未使用', 'ok');
+        await loadSchoolVouchers();
+      } catch (e) {
+        toast('更新券码状态失败: ' + e.message, 'err');
+        b.disabled = false;
+      }
+    });
     body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
       try { await copyText(b.dataset.copy); toast('券码已复制', 'ok'); }
       catch (e) { toast('复制失败，请手动选择券码', 'err'); }
@@ -1073,6 +1135,16 @@ async function loadSchoolVouchers() {
 $('btnSchoolVouchers').onclick = loadSchoolVouchers;
 $('btnVcClose').onclick = () => $('vcVeil').classList.remove('on');
 $('btnVcRefresh').onclick = loadSchoolVouchers;
+const chkHide = $('chkHideUsed');
+if (chkHide) {
+  const hidePref = localStorage.getItem('wb2api_hide_used_vouchers') === '1';
+  chkHide.checked = hidePref;
+  $('vcBody').classList.toggle('hide-used', hidePref);
+  chkHide.onchange = () => {
+    $('vcBody').classList.toggle('hide-used', chkHide.checked);
+    localStorage.setItem('wb2api_hide_used_vouchers', chkHide.checked ? '1' : '0');
+  };
+}
 
 /* 成长任务队列。lastQueueSeq 记录本页启动过的队列代次：执行结束后的残留 items
    （running=false 但 seq 停在旧值）不再回写视图——否则扫描结果 3 秒后被上一轮
