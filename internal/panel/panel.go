@@ -501,6 +501,7 @@ func (p *Panel) accountRemark(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "failed to set remark: "+err.Error())
 		return
 	}
+	log.Printf("panel: 设置账号备注 uid=%s remark=%q", uid, a.RemarkValue())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":           true,
 		"uid":          uid,

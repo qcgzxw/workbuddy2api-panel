@@ -614,16 +614,8 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 					if vStore == nil {
 						vStore = p.cfg.VoucherStore
 					}
+					it.Vouchers = vStore.Enrich(vs)
 					if vStore != nil {
-						it.Vouchers = vStore.Enrich(vs)
-					} else {
-						it.Vouchers = vStore.Enrich(vs)
-					}
-					notifier := p.notifier
-					if notifier == nil {
-						notifier = p.cfg.Notifier
-					}
-					if (notifier != nil && notifier.Enabled()) || vStore != nil {
 						go p.checkAndNotifyVouchers(a, vs)
 					}
 				}
@@ -682,6 +674,7 @@ func (p *Panel) checkAndNotifyVouchers(a *auth.Auth, vouchers []upstream.SchoolV
 			log.Printf("panel %s: tg notify voucher %s failed: %v", a.UID, v.Code, err)
 		} else {
 			successList = append(successList, v)
+			log.Printf("panel %s: 📢 已推送 Telegram 中奖通知: %s (%s)", a.UID, v.PrizeName, v.Code)
 		}
 	}
 	if len(successList) > 0 {
@@ -724,6 +717,7 @@ func (p *Panel) voucherStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("panel: 更新券码状态 code=%s is_used=%v", body.Code, body.IsUsed)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"code":    body.Code,
