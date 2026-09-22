@@ -75,6 +75,10 @@ type Panel struct {
 	started time.Time
 	logs    *Ring
 
+	voucherStore   *voucher.Store
+	notifier       *notify.Notifier
+	voucherCheckMu sync.Mutex
+
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
@@ -133,11 +137,13 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:          cfg,
+		mux:          http.NewServeMux(),
+		started:      time.Now(),
+		logs:         NewRing(500),
+		logins:       map[string]loginSession{},
+		voucherStore: cfg.VoucherStore,
+		notifier:     cfg.Notifier,
 	}
 	p.routes()
 	return p
@@ -159,6 +165,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remark", p.withAuth(p.accountRemark))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
@@ -172,6 +179,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/school/status", p.withAuth(p.schoolStatus))
 	p.mux.HandleFunc("POST /panel/api/school/run_all", p.withAuth(p.schoolRunAll))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
+	p.mux.HandleFunc("POST /panel/api/school/vouchers/status", p.withAuth(p.voucherStatus))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
@@ -472,6 +480,33 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountRemark 更新账号文字备注（落盘到 auth 文件）。
+func (p *Panel) accountRemark(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	var body struct {
+		Remark string `json:"remark"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if err := a.SetRemark(body.Remark); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to set remark: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"uid":          uid,
+		"remark":       a.RemarkValue(),
+		"display_name": a.DisplayName(),
+	})
 }
 
 // ---------------------------------------------------------------------------

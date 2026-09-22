@@ -16,11 +16,14 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/notify"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/voucher"
 )
 
 // ---------------------------------------------------------------------------
@@ -577,10 +580,10 @@ func (p *Panel) schoolRunAll(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 	accts := p.cfg.Pool.List()
 	type row struct {
-		UID      string                   `json:"uid"`
-		Nickname string                   `json:"nickname"`
-		Vouchers []upstream.SchoolVoucher `json:"vouchers"`
-		Err      string                   `json:"error,omitempty"`
+		UID      string                  `json:"uid"`
+		Nickname string                  `json:"nickname"`
+		Vouchers []voucher.EnrichedVoucher `json:"vouchers"`
+		Err      string                  `json:"error,omitempty"`
 	}
 	out := make([]row, len(accts))
 	sem := make(chan struct{}, 3)
@@ -598,7 +601,7 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			it := row{UID: a.UID, Nickname: a.Nickname}
+			it := row{UID: a.UID, Nickname: a.DisplayName(), Vouchers: []voucher.EnrichedVoucher{}}
 			switch {
 			case a.IsGlobal():
 				it.Err = "global realm（无开学季活动）"
@@ -607,7 +610,22 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					it.Err = err.Error()
 				} else {
-					it.Vouchers = vs
+					vStore := p.voucherStore
+					if vStore == nil {
+						vStore = p.cfg.VoucherStore
+					}
+					if vStore != nil {
+						it.Vouchers = vStore.Enrich(vs)
+					} else {
+						it.Vouchers = vStore.Enrich(vs)
+					}
+					notifier := p.notifier
+					if notifier == nil {
+						notifier = p.cfg.Notifier
+					}
+					if (notifier != nil && notifier.Enabled()) || vStore != nil {
+						go p.checkAndNotifyVouchers(a, vs)
+					}
 				}
 			}
 			out[i] = it
@@ -621,4 +639,94 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": res})
+}
+
+// checkAndNotifyVouchers 增量检查并推送中奖通知（持锁防重）。
+func (p *Panel) checkAndNotifyVouchers(a *auth.Auth, vouchers []upstream.SchoolVoucher) {
+	vStore := p.voucherStore
+	if vStore == nil {
+		vStore = p.cfg.VoucherStore
+	}
+	if a == nil || vStore == nil || len(vouchers) == 0 {
+		return
+	}
+	p.voucherCheckMu.Lock()
+	defer p.voucherCheckMu.Unlock()
+
+	unnotified := vStore.FilterUnnotified(vouchers)
+	if len(unnotified) == 0 {
+		return
+	}
+	displayName := a.DisplayName()
+	notifier := p.notifier
+	if notifier == nil {
+		notifier = p.cfg.Notifier
+	}
+	if notifier == nil || !notifier.Enabled() {
+		if err := vStore.MarkNotified(a.UID, displayName, unnotified); err != nil {
+			log.Printf("panel %s: mark silent notified error: %v", a.UID, err)
+		}
+		return
+	}
+	var successList []upstream.SchoolVoucher
+	for _, v := range unnotified {
+		evt := notify.VoucherWonEvent{
+			DisplayName: displayName,
+			PrizeName:   v.PrizeName,
+			SKUCode:     v.SKUCode,
+			Code:        v.Code,
+			ValidTo:     v.ValidTo,
+			GrantedAt:   v.GrantedAt,
+		}
+		if err := notifier.SendVoucherWon(evt); err != nil {
+			log.Printf("panel %s: tg notify voucher %s failed: %v", a.UID, v.Code, err)
+		} else {
+			successList = append(successList, v)
+		}
+	}
+	if len(successList) > 0 {
+		if err := vStore.MarkNotified(a.UID, displayName, successList); err != nil {
+			log.Printf("panel %s: mark notified error: %v", a.UID, err)
+		}
+	}
+}
+
+// voucherStatus 标记券码使用状态。
+func (p *Panel) voucherStatus(w http.ResponseWriter, r *http.Request) {
+	vStore := p.voucherStore
+	if vStore == nil {
+		vStore = p.cfg.VoucherStore
+	}
+	if vStore == nil {
+		writeErr(w, http.StatusNotImplemented, "voucher store not configured")
+		return
+	}
+
+	var body struct {
+		Code      string `json:"code"`
+		IsUsed    bool   `json:"is_used"`
+		UID       string `json:"uid"`
+		Nickname  string `json:"nickname"`
+		PrizeName string `json:"prize_name"`
+		ValidTo   string `json:"valid_to"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(body.Code) == "" {
+		writeErr(w, http.StatusBadRequest, "code is required")
+		return
+	}
+
+	if err := vStore.SetUsed(body.Code, body.IsUsed, body.UID, body.Nickname, body.PrizeName, body.ValidTo); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to update voucher status: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"code":    body.Code,
+		"is_used": body.IsUsed,
+	})
 }
