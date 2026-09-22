@@ -13,6 +13,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/notify"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -21,6 +22,9 @@ const (
 	schoolPollLoops = 3
 	schoolPollGap   = 2500 * time.Millisecond
 )
+
+// schoolDrawDelay 抽奖间隔（上游风控规避），测试可置 0。
+var schoolDrawDelay = 2 * time.Second
 
 // RunSchoolNow 对所有可用账号执行开学季活动闭环（幂等：不在期/已领静默跳过）。
 // 由 RunCheckinNow 末尾调用（活动是每日刷新，搭每日签到的车最自然）。
@@ -80,7 +84,52 @@ func (s *Scheduler) schoolAccount(a *auth.Auth) {
 			return
 		}
 		log.Printf("school %s: 🎲 %s", logfmt.Label(a.UID, a.Nickname), prize)
-		time.Sleep(2 * time.Second)
+		time.Sleep(schoolDrawDelay)
+	}
+	if chances > 0 && s.cfg.VoucherStore != nil {
+		vouchers, err := s.cfg.Upstream.SchoolVouchers(a)
+		if err == nil {
+			s.checkAndNotifyVouchers(a, vouchers)
+		} else {
+			log.Printf("school %s: check vouchers failed: %v", logfmt.Label(a.UID, a.DisplayName()), err)
+		}
+	}
+}
+
+// checkAndNotifyVouchers 增量检测新券码并推送 Telegram 通知。
+func (s *Scheduler) checkAndNotifyVouchers(a *auth.Auth, vouchers []upstream.SchoolVoucher) {
+	if a == nil || s.cfg.VoucherStore == nil || len(vouchers) == 0 {
+		return
+	}
+	unnotified := s.cfg.VoucherStore.FilterUnnotified(vouchers)
+	if len(unnotified) == 0 {
+		return
+	}
+	displayName := a.DisplayName()
+	if s.cfg.Notifier == nil || !s.cfg.Notifier.Enabled() {
+		_ = s.cfg.VoucherStore.MarkNotified(a.UID, displayName, unnotified)
+		return
+	}
+
+	var successList []upstream.SchoolVoucher
+	for _, v := range unnotified {
+		evt := notify.VoucherWonEvent{
+			DisplayName: displayName,
+			PrizeName:   v.PrizeName,
+			SKUCode:     v.SKUCode,
+			Code:        v.Code,
+			ValidTo:     v.ValidTo,
+			GrantedAt:   v.GrantedAt,
+		}
+		if err := s.cfg.Notifier.SendVoucherWon(evt); err != nil {
+			log.Printf("school %s: tg notify voucher %s failed: %v", logfmt.Label(a.UID, displayName), v.Code, err)
+		} else {
+			successList = append(successList, v)
+			log.Printf("school %s: 📢 已推送 Telegram 中奖通知: %s (%s)", logfmt.Label(a.UID, displayName), v.PrizeName, v.Code)
+		}
+	}
+	if len(successList) > 0 {
+		_ = s.cfg.VoucherStore.MarkNotified(a.UID, displayName, successList)
 	}
 }
 
