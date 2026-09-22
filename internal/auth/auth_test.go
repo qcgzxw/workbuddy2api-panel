@@ -311,7 +311,7 @@ func TestAuthRemarkAndDisplayName(t *testing.T) {
 		t.Errorf("expected remark '备用号', got %q", aFlat.Remark)
 	}
 
-	// 3. 测试无 remark 时的 DisplayName 回退
+	// 3. 测试 DisplayName 规则（含 UID 截断与短 UID 处理）
 	aEmptyRemark := &Auth{Nickname: "13700000000", UID: "abcdef123456"}
 	if aEmptyRemark.DisplayName() != "13700000000" {
 		t.Errorf("expected nickname display name, got %q", aEmptyRemark.DisplayName())
@@ -320,8 +320,33 @@ func TestAuthRemarkAndDisplayName(t *testing.T) {
 	if aEmptyAll.DisplayName() != "abcdef12" {
 		t.Errorf("expected truncated uid fallback, got %q", aEmptyAll.DisplayName())
 	}
+	// 短 UID (<= 8 位) 且有 Remark 无 Nickname：应显示为 "Remark (UID)"
+	aShortUID := &Auth{UID: "u123", Remark: "测试备注"}
+	if aShortUID.DisplayName() != "测试备注 (u123)" {
+		t.Errorf("expected '测试备注 (u123)', got %q", aShortUID.DisplayName())
+	}
+	// 长 UID (> 8 位) 且有 Remark 无 Nickname：应显示为 "Remark (UID[:8])"
+	aLongUID := &Auth{UID: "1234567890abcdef", Remark: "测试备注"}
+	if aLongUID.DisplayName() != "测试备注 (12345678)" {
+		t.Errorf("expected '测试备注 (12345678)', got %q", aLongUID.DisplayName())
+	}
+	// 空 UID 且有 Remark 无 Nickname：应显示为 "Remark"
+	aEmptyUID := &Auth{UID: "", Remark: "测试备注"}
+	if aEmptyUID.DisplayName() != "测试备注" {
+		t.Errorf("expected '测试备注', got %q", aEmptyUID.DisplayName())
+	}
 
-	// 4. 测试 SetRemark 原子写回与防死锁
+	// 4. 测试 RemarkValue 与 RemarkAndDisplayName
+	remVal := a.RemarkValue()
+	if remVal != "张三主号" {
+		t.Errorf("expected RemarkValue '张三主号', got %q", remVal)
+	}
+	rem, disp := a.RemarkAndDisplayName()
+	if rem != "张三主号" || disp != "张三主号 (13800000000)" {
+		t.Errorf("unexpected RemarkAndDisplayName: (%q, %q)", rem, disp)
+	}
+
+	// 5. 测试 SetRemark 原子写回与防死锁
 	tmpDir := t.TempDir()
 	filePath := filepath.Join(tmpDir, "workbuddy-test.json")
 	if err := os.WriteFile(filePath, []byte(nestedJSON), 0o600); err != nil {
@@ -331,8 +356,8 @@ func TestAuthRemarkAndDisplayName(t *testing.T) {
 	if err := a.SetRemark("新备注名"); err != nil {
 		t.Fatalf("SetRemark failed: %v", err)
 	}
-	if a.Remark != "新备注名" {
-		t.Errorf("expected remark updated to '新备注名', got %q", a.Remark)
+	if a.RemarkValue() != "新备注名" {
+		t.Errorf("expected remark updated to '新备注名', got %q", a.RemarkValue())
 	}
 
 	// 读取落盘文件验证
@@ -342,6 +367,41 @@ func TestAuthRemarkAndDisplayName(t *testing.T) {
 	}
 	if reloaded.Remark != "新备注名" {
 		t.Errorf("expected reloaded remark '新备注名', got %q", reloaded.Remark)
+	}
+
+	// 6. 测试清空备注 SetRemark("")：落盘 JSON 必须剔除 "remark" 键
+	if err := a.SetRemark(""); err != nil {
+		t.Fatalf("SetRemark(\"\") failed: %v", err)
+	}
+	if a.RemarkValue() != "" {
+		t.Errorf("expected empty remark in memory, got %q", a.RemarkValue())
+	}
+	rawCleared, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawCleared), `"remark"`) {
+		t.Errorf("expected 'remark' key to be omitted when empty, got:\n%s", string(rawCleared))
+	}
+	reloadedCleared, err := ParseFile(filePath)
+	if err != nil {
+		t.Fatalf("reloading cleared file failed: %v", err)
+	}
+	if reloadedCleared.Remark != "" {
+		t.Errorf("expected reloaded cleared remark to be empty, got %q", reloadedCleared.Remark)
+	}
+
+	// 7. 测试落盘失败时回滚内存状态
+	if err := a.SetRemark("回滚前备注"); err != nil {
+		t.Fatalf("SetRemark failed: %v", err)
+	}
+	// 制造不可写的目录路径使落盘失败
+	a.FilePath = filepath.Join(tmpDir, "nonexistent-dir", "test.json")
+	if err := a.SetRemark("应当被回滚的备注"); err == nil {
+		t.Fatal("expected error on invalid FilePath, got nil")
+	}
+	if a.RemarkValue() != "回滚前备注" {
+		t.Errorf("expected remark to be rolled back to '回滚前备注', got %q", a.RemarkValue())
 	}
 }
 

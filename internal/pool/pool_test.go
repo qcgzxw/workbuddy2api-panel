@@ -1733,3 +1733,84 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 		t.Fatalf("state.json contains credential field: %s", raw)
 	}
 }
+
+func TestPoolStatusRemarkAndDisplayName(t *testing.T) {
+	p := New("")
+	a := &auth.Auth{
+		UID:      "u123456789",
+		Nickname: "Nick1",
+		Remark:   "Remark1",
+	}
+	p.Add(a)
+
+	st, ok := p.Status("u123456789")
+	if !ok {
+		t.Fatal("account not found in pool")
+	}
+	if st.Remark != "Remark1" {
+		t.Errorf("expected Status.Remark %q, got %q", "Remark1", st.Remark)
+	}
+	if st.DisplayName != "Remark1 (Nick1)" {
+		t.Errorf("expected Status.DisplayName %q, got %q", "Remark1 (Nick1)", st.DisplayName)
+	}
+
+	statuses := p.List()
+	if len(statuses) != 1 {
+		t.Fatalf("expected 1 status, got %d", len(statuses))
+	}
+	if statuses[0].Remark != "Remark1" || statuses[0].DisplayName != "Remark1 (Nick1)" {
+		t.Errorf("List() remark/displayName mismatch: %+v", statuses[0])
+	}
+}
+
+func TestPoolStatusRemarkDataRace(t *testing.T) {
+	tmpDir := t.TempDir()
+	fp := filepath.Join(tmpDir, "workbuddy-race.json")
+	initialJSON := `{
+		"account": {"uid": "u-race", "nickname": "RaceNick", "remark": "initial"},
+		"auth": {"accessToken": "at", "refreshToken": "rt", "domain": "www.codebuddy.cn"}
+	}`
+	if err := os.WriteFile(fp, []byte(initialJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := auth.ParseFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New("")
+	p.Add(a)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Goroutine 1: repeatedly updates remark
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = a.SetRemark(fmt.Sprintf("remark-%d", i))
+			}
+		}
+	}()
+
+	// Goroutine 2: repeatedly reads List() and Status()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_ = p.List()
+			st, ok := p.Status("u-race")
+			if ok && st.Remark != "" && !strings.HasPrefix(st.DisplayName, st.Remark) {
+				t.Errorf("inconsistent DisplayName: remark=%q display=%q", st.Remark, st.DisplayName)
+			}
+		}
+		close(stop)
+	}()
+
+	wg.Wait()
+}
+

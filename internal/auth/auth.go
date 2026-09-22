@@ -289,21 +289,49 @@ func Parse(raw []byte) (*Auth, error) {
 	return &a, nil
 }
 
+// RemarkValue 返回当前的 Remark，并发安全。
+func (a *Auth) RemarkValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Remark
+}
+
+// RemarkAndDisplayName 返回 Remark 与 DisplayName，原子持锁读取，杜绝并发竞争与撕裂读。
+func (a *Auth) RemarkAndDisplayName() (string, string) {
+	if a == nil {
+		return "", ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Remark, a.displayNameLocked()
+}
+
 // DisplayName 返回账号的展示名称：
-// 优先使用 Remark，有 Nickname 时为 "Remark (Nickname)"，若只有 UID 且 UID > 8 位则为 "Remark (UID[:8])"，
-// 否则为 Remark 本身；无 Remark 时回退为 Nickname，若无 Nickname 则回退为截断的 UID（最多 8 位）或全 UID。
+// 优先使用 Remark，有 Nickname 时为 "Remark (Nickname)"，若只有 UID 则为 "Remark (UID[:8])"（最多8位），
+// 仅当 UID 为空时才为 Remark 本身；无 Remark 时回退为 Nickname，若无 Nickname 则回退为截断的 UID（最多 8 位）或全 UID。
 func (a *Auth) DisplayName() string {
 	if a == nil {
 		return ""
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.displayNameLocked()
+}
+
+func (a *Auth) displayNameLocked() string {
 	if a.Remark != "" {
 		if a.Nickname != "" {
 			return fmt.Sprintf("%s (%s)", a.Remark, a.Nickname)
 		}
-		if len(a.UID) > 8 {
-			return fmt.Sprintf("%s (%s)", a.Remark, a.UID[:8])
+		uidPart := a.UID
+		if len(uidPart) > 8 {
+			uidPart = uidPart[:8]
+		}
+		if uidPart != "" {
+			return fmt.Sprintf("%s (%s)", a.Remark, uidPart)
 		}
 		return a.Remark
 	}
@@ -316,15 +344,20 @@ func (a *Auth) DisplayName() string {
 	return a.UID
 }
 
-// SetRemark 更新账号文字备注并原子持久化落盘。
+// SetRemark 更新账号文字备注并原子持久化落盘。若落盘失败则回滚内存状态。
 func (a *Auth) SetRemark(remark string) error {
 	if a == nil {
 		return fmt.Errorf("nil auth")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	oldRemark := a.Remark
 	a.Remark = strings.TrimSpace(remark)
-	return a.saveAtomicLocked()
+	if err := a.saveAtomicLocked(); err != nil {
+		a.Remark = oldRemark
+		return err
+	}
+	return nil
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
