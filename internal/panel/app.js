@@ -39,7 +39,7 @@ async function api(path, opts = {}) {
   if (init.body != null && typeof init.body === 'object' && !(init.body instanceof FormData) && !(init.body instanceof Blob)) {
     init.body = JSON.stringify(init.body);
   }
-  if (init.body) h['Content-Type'] = 'application/json';
+  if (init.body && !h['Content-Type'] && !(typeof FormData !== 'undefined' && init.body instanceof FormData)) h['Content-Type'] = 'application/json';
   init.headers = h;
   const r = await fetch('/panel/api/' + path, init);
   if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
@@ -1107,7 +1107,30 @@ async function loadSchoolVouchers() {
           body: { code: code, is_used: isUsed }
         });
         toast(isUsed ? '已标记为已使用' : '已恢复为未使用', 'ok');
-        await loadSchoolVouchers();
+        const card = b.closest('.vc');
+        if (card) {
+          card.classList.toggle('used', isUsed);
+          const tag = card.querySelector('.tag');
+          if (tag) {
+            if (isUsed) {
+              tag.className = 'tag muted';
+              tag.textContent = '已使用';
+            } else if (card.classList.contains('expired')) {
+              tag.className = 'tag bad';
+              tag.textContent = '已过期';
+            } else {
+              tag.className = 'tag ok';
+              tag.textContent = '可使用';
+            }
+          }
+          b.dataset.next = isUsed ? 'false' : 'true';
+          b.textContent = isUsed ? '恢复未使用' : '标记已使用';
+        }
+        b.disabled = false;
+        const total = body.querySelectorAll('.vc').length;
+        const usedCount = body.querySelectorAll('.vc.used').length;
+        const availCount = total - usedCount;
+        $('vcNote').textContent = total ? total + ' 张券（' + availCount + ' 张可用 · ' + usedCount + ' 张已使用）' : '';
       } catch (e) {
         toast('更新券码状态失败: ' + e.message, 'err');
         b.disabled = false;
