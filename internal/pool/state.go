@@ -467,6 +467,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		RateLimitedModels: p.rateLimitedModelsLocked(e, now),
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
+		Remark:            e.a.Remark,
+		DisplayName:       e.a.DisplayName(),
 		Credits:           e.credits,
 		CreditsTotal:      e.creditsTotal,
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),

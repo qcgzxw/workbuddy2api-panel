@@ -264,3 +264,84 @@ func TestLoadDirDuplicateUIDWarning(t *testing.T) {
 		t.Errorf("expected WARN with both paths, got output: %s", string(raw))
 	}
 }
+
+func TestAuthRemarkAndDisplayName(t *testing.T) {
+	// 1. 测试嵌套形凭据解析 remark
+	nestedJSON := `{
+		"account": {
+			"uid": "u123",
+			"nickname": "13800000000",
+			"remark": "张三主号"
+		},
+		"auth": {
+			"accessToken": "test-at",
+			"refreshToken": "test-rt",
+			"expiresAt": 1800000000,
+			"domain": "www.codebuddy.cn",
+			"realm": "cn"
+		}
+	}`
+	a, err := Parse([]byte(nestedJSON))
+	if err != nil {
+		t.Fatalf("parse nested auth failed: %v", err)
+	}
+	if a.Remark != "张三主号" {
+		t.Errorf("expected remark '张三主号', got %q", a.Remark)
+	}
+	if a.DisplayName() != "张三主号 (13800000000)" {
+		t.Errorf("expected display name '张三主号 (13800000000)', got %q", a.DisplayName())
+	}
+
+	// 2. 测试扁平形凭据解析 remark
+	flatJSON := `{
+		"uid": "u456",
+		"nickname": "13900000000",
+		"remark": "备用号",
+		"accessToken": "test-at",
+		"refreshToken": "test-rt",
+		"expiresAt": 1800000000,
+		"domain": "www.codebuddy.cn",
+		"realm": "cn"
+	}`
+	aFlat, err := Parse([]byte(flatJSON))
+	if err != nil {
+		t.Fatalf("parse flat auth failed: %v", err)
+	}
+	if aFlat.Remark != "备用号" {
+		t.Errorf("expected remark '备用号', got %q", aFlat.Remark)
+	}
+
+	// 3. 测试无 remark 时的 DisplayName 回退
+	aEmptyRemark := &Auth{Nickname: "13700000000", UID: "abcdef123456"}
+	if aEmptyRemark.DisplayName() != "13700000000" {
+		t.Errorf("expected nickname display name, got %q", aEmptyRemark.DisplayName())
+	}
+	aEmptyAll := &Auth{UID: "abcdef123456789"}
+	if aEmptyAll.DisplayName() != "abcdef12" {
+		t.Errorf("expected truncated uid fallback, got %q", aEmptyAll.DisplayName())
+	}
+
+	// 4. 测试 SetRemark 原子写回与防死锁
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "workbuddy-test.json")
+	if err := os.WriteFile(filePath, []byte(nestedJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.FilePath = filePath
+	if err := a.SetRemark("新备注名"); err != nil {
+		t.Fatalf("SetRemark failed: %v", err)
+	}
+	if a.Remark != "新备注名" {
+		t.Errorf("expected remark updated to '新备注名', got %q", a.Remark)
+	}
+
+	// 读取落盘文件验证
+	reloaded, err := ParseFile(filePath)
+	if err != nil {
+		t.Fatalf("reloading file failed: %v", err)
+	}
+	if reloaded.Remark != "新备注名" {
+		t.Errorf("expected reloaded remark '新备注名', got %q", reloaded.Remark)
+	}
+}
+

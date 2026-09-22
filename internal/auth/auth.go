@@ -36,6 +36,7 @@ type Auth struct {
 	UID          string
 	EnterpriseID string
 	Nickname     string
+	Remark       string // 账号备注名（例如："张三主号"），落盘于 account.remark（嵌套形）或顶层 remark（扁平形）
 	FilePath     string // 来源文件；refresh 后原子写回此处
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
@@ -233,6 +234,7 @@ func Parse(raw []byte) (*Auth, error) {
 				UID          string `json:"uid"`
 				EnterpriseID string `json:"enterpriseId"`
 				Nickname     string `json:"nickname"`
+				Remark       string `json:"remark"`
 			} `json:"account"`
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 			DeviceToken string `json:"device_token"`
@@ -249,6 +251,7 @@ func Parse(raw []byte) (*Auth, error) {
 			UID:          n.Account.UID,
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
+			Remark:       strings.TrimSpace(n.Account.Remark),
 			DeviceToken:  n.DeviceToken,
 		}
 	} else {
@@ -261,6 +264,7 @@ func Parse(raw []byte) (*Auth, error) {
 			UID          string `json:"uid"`
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
+			Remark       string `json:"remark"`
 			DeviceToken  string `json:"device_token"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
@@ -275,6 +279,7 @@ func Parse(raw []byte) (*Auth, error) {
 			UID:          f.UID,
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
+			Remark:       strings.TrimSpace(f.Remark),
 			DeviceToken:  f.DeviceToken,
 		}
 	}
@@ -284,17 +289,67 @@ func Parse(raw []byte) (*Auth, error) {
 	return &a, nil
 }
 
+// DisplayName 返回账号的展示名称：
+// 优先使用 Remark，有 Nickname 时为 "Remark (Nickname)"，若只有 UID 且 UID > 8 位则为 "Remark (UID[:8])"，
+// 否则为 Remark 本身；无 Remark 时回退为 Nickname，若无 Nickname 则回退为截断的 UID（最多 8 位）或全 UID。
+func (a *Auth) DisplayName() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.Remark != "" {
+		if a.Nickname != "" {
+			return fmt.Sprintf("%s (%s)", a.Remark, a.Nickname)
+		}
+		if len(a.UID) > 8 {
+			return fmt.Sprintf("%s (%s)", a.Remark, a.UID[:8])
+		}
+		return a.Remark
+	}
+	if a.Nickname != "" {
+		return a.Nickname
+	}
+	if len(a.UID) > 8 {
+		return a.UID[:8]
+	}
+	return a.UID
+}
+
+// SetRemark 更新账号文字备注并原子持久化落盘。
+func (a *Auth) SetRemark(remark string) error {
+	if a == nil {
+		return fmt.Errorf("nil auth")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Remark = strings.TrimSpace(remark)
+	return a.saveAtomicLocked()
+}
+
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
 // 全程持 a.mu：防止与 RefreshToken 修改 token 字段并发，杜绝写回半更新。
 // 防御：accessToken 为空时拒绝写回，避免误用空凭证覆盖有效文件。
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.saveAtomicLocked()
+}
+
+func (a *Auth) saveAtomicLocked() error {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
 	}
 	if a.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
+	}
+	acct := map[string]any{
+		"uid":          a.UID,
+		"enterpriseId": a.EnterpriseID,
+		"nickname":     a.Nickname,
+	}
+	if a.Remark != "" {
+		acct["remark"] = a.Remark
 	}
 	doc := map[string]any{
 		"auth": map[string]any{
@@ -304,11 +359,7 @@ func (a *Auth) SaveAtomic() error {
 			"domain":       a.Domain,
 			"realm":        a.realm,
 		},
-		"account": map[string]any{
-			"uid":          a.UID,
-			"enterpriseId": a.EnterpriseID,
-			"nickname":     a.Nickname,
-		},
+		"account": acct,
 	}
 	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
@@ -334,6 +385,20 @@ func (a *Auth) SaveAtomic() error {
 	return os.Rename(tmp, a.FilePath)
 }
 
+// ParseFile 读取指定路径的 auth 文件并解析，同时回填 FilePath。
+func ParseFile(path string) (*Auth, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	a, err := Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	a.FilePath = path
+	return a, nil
+}
+
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
 // 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
@@ -348,15 +413,10 @@ func LoadDir(dir string) ([]*Auth, error) {
 	seenUID := make(map[string]string, len(files))
 	var out []*Auth
 	for _, f := range files {
-		raw, err := os.ReadFile(f)
+		a, err := ParseFile(f)
 		if err != nil {
 			continue
 		}
-		a, err := Parse(raw)
-		if err != nil {
-			continue
-		}
-		a.FilePath = f
 		if prev, ok := seenUID[a.UID]; ok {
 			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
 				logfmt.Label(a.UID, a.Nickname), prev, f)

@@ -63,6 +63,8 @@ type TokenUsageDelta struct {
 type Status struct {
 	UID           string    `json:"uid"`
 	Nickname      string    `json:"nickname,omitempty"`
+	Remark        string    `json:"remark,omitempty"`
+	DisplayName   string    `json:"display_name,omitempty"`
 	Credits       int64     `json:"credits"`
 	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
 	Cooling       bool      `json:"cooling"`
