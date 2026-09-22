@@ -21,6 +21,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/notify"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -29,6 +30,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/voucher"
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
@@ -189,9 +191,20 @@ func main() {
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
 
+	vStore, err := voucher.NewStore(cfg.VoucherFile)
+	if err != nil {
+		log.Fatalf("初始化券码存储失败 (%s): %v", cfg.VoucherFile, err)
+	}
+	tgNotifier := notify.NewNotifier(cfg.Telegram)
+	if tgNotifier.Enabled() {
+		log.Printf("[notify] Telegram 抽奖中奖推送已启用 (chat_id=%s)", cfg.Telegram.ChatID)
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
+		VoucherStore:   vStore,
+		Notifier:       tgNotifier,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
@@ -258,11 +271,13 @@ func main() {
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
 	pn := panel.New(panel.Config{
-		Pool:        p,
-		Usage:       rec,
-		Upstream:    up,
-		Scheduler:   sch,
-		AuthDir:     cfg.AuthDir,
+		Pool:         p,
+		Usage:        rec,
+		Upstream:     up,
+		Scheduler:    sch,
+		VoucherStore: vStore,
+		Notifier:     tgNotifier,
+		AuthDir:      cfg.AuthDir,
 		APIKey:      cfg.APIKey,
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
@@ -444,6 +459,12 @@ func restartRequiredFields(c *Config) []string {
 	}
 	if c.StateFile != "" {
 		out = append(out, "state_file")
+	}
+	if c.VoucherFile != "" {
+		out = append(out, "voucher_file")
+	}
+	if c.Telegram.Enabled || c.Telegram.BotToken != "" || c.Telegram.ChatID != "" {
+		out = append(out, "telegram")
 	}
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {

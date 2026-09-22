@@ -3,6 +3,12 @@
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": ""
+  },
+  "voucher_file": "./data/vouchers.json",
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"

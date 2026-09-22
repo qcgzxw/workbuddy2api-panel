@@ -12,15 +12,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/notify"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	Listen      string        `json:"listen"`     // ":7863"
+	APIKey      string        `json:"api_key"`    // 空 = 不鉴权
+	AuthDir     string        `json:"auth_dir"`   // ./auths
+	StateFile   string        `json:"state_file"` // ./data/state.json
+	Telegram    notify.Config `json:"telegram"`
+	VoucherFile string        `json:"voucher_file"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -171,10 +174,11 @@ type Config struct {
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
-		Listen:    ":7863",
-		APIKey:    "",
-		AuthDir:   "./auths",
-		StateFile: "./data/state.json",
+		Listen:      ":7863",
+		APIKey:      "",
+		AuthDir:     "./auths",
+		StateFile:   "./data/state.json",
+		VoucherFile: "./data/vouchers.json",
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
@@ -313,6 +317,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
+	}
+	if v := os.Getenv("WB2A_VOUCHER_FILE"); v != "" {
+		c.VoucherFile = v
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
@@ -458,6 +465,9 @@ func (c *Config) normalize() error {
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
+	}
+	if strings.TrimSpace(c.VoucherFile) == "" {
+		c.VoucherFile = "./data/vouchers.json"
 	}
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。

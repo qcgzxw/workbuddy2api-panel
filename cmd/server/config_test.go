@@ -719,3 +719,82 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 		t.Errorf("error should point at the dir-mount layout + auto-generate: %v", err)
 	}
 }
+
+func TestVoucherAndTelegramConfig(t *testing.T) {
+	c := Default()
+	if c.VoucherFile != "./data/vouchers.json" {
+		t.Errorf("VoucherFile=%q want ./data/vouchers.json", c.VoucherFile)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.VoucherFile != "./data/vouchers.json" {
+		t.Errorf("VoucherFile=%q want ./data/vouchers.json after normalize", c.VoucherFile)
+	}
+
+	// Empty string in c.VoucherFile should normalize back to default
+	c.VoucherFile = "   "
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.VoucherFile != "./data/vouchers.json" {
+		t.Errorf("VoucherFile=%q want ./data/vouchers.json after normalize whitespace", c.VoucherFile)
+	}
+
+	// Parse from file
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{
+		"voucher_file": "./custom/vouchers.json",
+		"telegram": {
+			"enabled": true,
+			"bot_token": "123:ABC",
+			"chat_id": "456"
+		}
+	}`), 0o600)
+	loaded, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.VoucherFile != "./custom/vouchers.json" {
+		t.Errorf("VoucherFile=%q want ./custom/vouchers.json", loaded.VoucherFile)
+	}
+	if !loaded.Telegram.Enabled || loaded.Telegram.BotToken != "123:ABC" || loaded.Telegram.ChatID != "456" {
+		t.Errorf("Telegram=%+v want enabled with token and chat_id", loaded.Telegram)
+	}
+}
+
+func TestRestartRequiredFieldsVoucherAndTelegram(t *testing.T) {
+	c := &Config{}
+	fields := restartRequiredFields(c)
+	for _, f := range fields {
+		if f == "voucher_file" || f == "telegram" {
+			t.Errorf("empty config should not require restart for %s", f)
+		}
+	}
+
+	c.VoucherFile = "./data/vouchers.json"
+	fields = restartRequiredFields(c)
+	hasVoucher := false
+	for _, f := range fields {
+		if f == "voucher_file" {
+			hasVoucher = true
+		}
+	}
+	if !hasVoucher {
+		t.Error("expected voucher_file in restartRequiredFields")
+	}
+
+	c.Telegram.Enabled = true
+	fields = restartRequiredFields(c)
+	hasTelegram := false
+	for _, f := range fields {
+		if f == "telegram" {
+			hasTelegram = true
+		}
+	}
+	if !hasTelegram {
+		t.Error("expected telegram in restartRequiredFields")
+	}
+}
+

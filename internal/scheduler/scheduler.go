@@ -13,8 +13,10 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/notify"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/voucher"
 )
 
 // Config 调度器依赖。
@@ -24,6 +26,8 @@ import (
 type Config struct {
 	Pool           *pool.Pool
 	Upstream       *upstream.Client
+	VoucherStore   *voucher.Store
+	Notifier       *notify.Notifier
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
