@@ -1007,6 +1007,84 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	}
 }
 
+// TestModelsDynamicOnlyPicksCNRealmAccount /v1/models 的动态目录只从 **CN realm**
+// 账号拉取。
+//
+// 此前用 Pool.Pick()（无 realm 过滤），混合池里会选中 global 号去打 CN 目录端点——
+// 上游按账号域校验，表现为偶发失败、且面板（走 AvailableUIDsForRealm）与 /v1/models
+// 出两套目录。现在两侧选号同口径。
+func TestModelsDynamicOnlyPicksCNRealmAccount(t *testing.T) {
+	auth.SetGlobalEnabled(true) // 逃生门开启：realm 标识才按 domain 生效
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	clearCache := func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.lastFail = time.Time{}
+		dynamicModelsCache.Unlock()
+	}
+	clearCache()
+	t.Cleanup(clearCache)
+
+	var calls int
+	var authzs []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		authzs = append(authzs, authz)
+		return 200, `{"code":0,"data":{"models":[{"id":"dyn-cn"}],"agents":[]}}`, false
+	})
+
+	// 池里只有 global 号 → 无 CN 号可选：返回空目录，且**不得**打上游。
+	global := &auth.Auth{UID: "g1", AccessToken: "global-at", ExpiresAt: 9999999999, Domain: "workbuddy.ai"}
+	if _, err := auth.BackfillRealmFor(global, "global"); err != nil {
+		t.Fatal(err)
+	}
+	p := testPoolWith(global)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(resp["data"].([]any)); n != 0 {
+		t.Fatalf("纯 global 池不该产出 CN 目录条目，got %d", n)
+	}
+	if calls != 0 {
+		t.Fatalf("不该拿 global 号打 CN 目录端点，upstream calls=%d", calls)
+	}
+
+	// 加入一个 CN 号 → 照常拉取，且每一次上游调用都用 CN 号凭证
+	// （FetchModels 内部会打 /v3/config + 企业端点，故按次数断言而非固定 1）。
+	clearCache()
+	authzs = nil
+	p.Add(&auth.Auth{UID: "c1", AccessToken: "cn-at", ExpiresAt: 9999999999})
+	p.SetCredits("c1", 1000, 0)
+
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("GET", "/v1/models", nil))
+	if len(authzs) == 0 {
+		t.Fatal("有 CN 号时应拉取目录")
+	}
+	for i, az := range authzs {
+		if az != "Bearer cn-at" {
+			t.Fatalf("第 %d 次上游调用应使用 CN 号凭证，got %q", i+1, az)
+		}
+	}
+	var resp2 map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &resp2); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(resp2["data"].([]any)); n != 1 {
+		t.Fatalf("CN 号在池时应产出 1 条目录，got %d", n)
+	}
+}
+
 func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil

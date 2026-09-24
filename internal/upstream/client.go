@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1101,6 +1102,15 @@ type ModelInfo struct {
 	CanDisableThinking bool     // reasoning.canDisableThinking：思考可关（off 档可用）
 	ReasoningEffort    string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
 	ReasoningSummary   string   // reasoning.summary 推理摘要模式（如 "auto"）
+
+	// 优惠（modelPromotions，/v3/config data.modelPromotions）：Credits 是**牌价**
+	//（转正后基准倍率），Promo* 是当前生效的限时优惠——面板据此显示「生效价 +
+	// 标签 + 牌价」。PromoFactor 为 nil 表示无 machine-readable 折扣（如「错峰
+	// 使用」只有时段文案无 factor），仅挂标签/提示。
+	PromoFactor  *float64 // 折扣系数（0=限时免费，0.5=五折）；nil=无
+	PromoCredits string   // 折扣后倍率原文（如 "0x" / "0.50x"），仅展示
+	PromoLabel   string   // 徽章文案（限时免费 / 夜间折扣 / 错峰使用）
+	PromoNote    string   // hover 说明原文（含时段/日期描述）
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -1190,11 +1200,24 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 }
 
 // codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA。
-// CLI 三段式 WorkBuddy UA 会拿到精简目录（flash 输出 128K、无 supportedEfforts）；
-// 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 才返回完整能力
-// （flash：393216 + low/high/max）。
-// 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
+//
+// **实测（2026-09-22）该端点对不同 UA 下发的模型集合不同**，勿按旧注释推断：
+//   - IDE UA → 14 条（10 个 chat：含 o4-mini / enhance-1.0 / auto-chat，**无 deepseek 系列**）
+//   - CLI UA → 22 条（22 个 chat：**含 deepseek-v4.1-flash / deepseek-v4.1-flash-sg /
+//     gpt-6-astra / kimi-k2.8-preview**，但无 o4-mini / enhance-1.0 / auto-chat）
+//
+// 旧注释称「CLI 三段式 WorkBuddy UA 会拿到精简目录、IDE UA 才返回完整能力」——实测
+// 模型**数量**恰好相反，但 **IDE 响应体积更大**（26003B vs 21111B），故「完整能力」
+// 应理解为**单条字段更全**（如 flash 的 maxInputTokens 与 supportedEfforts 只在 IDE
+// 路下发），而非模型更多。两路各有独有模型，缺一不可。
+//
+// 版本号需随上游 IDE 发版跟进：UA 版本过旧时该端点可能同样返回精简目录。
 const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
+
+// codeBuddyCLIUA CLI 三段式 UA，仅用于 global 侧第二路探测（CN 侧仍走 codeBuddyIDEUA
+// 单路，行为不变）。该端点对 UA 敏感且**不同 UA 下发不同模型集合**，见 codeBuddyIDEUA
+// 注释的实测结论——global 侧必须两路并发取并集，否则 deepseek 系列或 o4-mini 必缺一路。
+const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //
@@ -1359,7 +1382,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
 // 失败返回错误（调用方降级为仅企业端点）。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
-	byID, err := c.fetchV3ConfigModelMap(a)
+	byID, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
 	if err != nil {
 		return nil, err
 	}
@@ -1422,9 +1445,148 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 	return "copilot.tencent.com"
 }
 
+// v3ModelPromotion /v3/config data.modelPromotions 单条优惠定义（2026-09-23 实测
+// 7 条：deepseek 系错峰五折、glm-5.2 夜间五折、hy3 与 hy4-preview-f 限时免费）。
+// discount 只在部分条目上存在：有 factor 的可算生效价；「错峰使用」类只有时段
+// 文案（factor 藏在 hover 文本里，无机器可读值），仅透出标签与说明。
+type v3ModelPromotion struct {
+	Enabled  bool     `json:"enabled"`
+	Priority int      `json:"priority"`
+	ModelIDs []string `json:"modelIds"`
+	Badge    *struct {
+		Label string `json:"label"`
+	} `json:"badge"`
+	Discount *struct {
+		DiscountedCredits string  `json:"discountedCredits"`
+		Factor            float64 `json:"factor"`
+	} `json:"discount"`
+	Hover *struct {
+		TextZh string `json:"textZh"`
+	} `json:"hover"`
+	Schedule *struct {
+		Daily []struct {
+			Start string `json:"start"` // "23:00"
+			End   string `json:"end"`   // "7:50"（可跨午夜）
+		} `json:"daily"`
+		Timezone   string `json:"timezone"`  // 实测恒 Asia/Shanghai
+		ValidFrom  string `json:"validFrom"` // RFC3339，可缺省
+		ValidUntil string `json:"validUntil"`
+	} `json:"schedule"`
+}
+
+// promoZone 优惠时区：上游恒 Asia/Shanghai（UTC+8 无夏令时），用 FixedZone 免依赖
+// 系统 tzdata（Windows 无 IANA 库时 LoadLocation 会失败）。
+var promoZone = time.FixedZone("CST", 8*3600)
+
+// promoClock 解析 "HH:MM" 为当日分钟数；坏值返回 (-1, false)。
+func promoClock(hhmm string) (int, bool) {
+	parts := strings.Split(hhmm, ":")
+	if len(parts) != 2 {
+		return -1, false
+	}
+	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || h < 0 || h > 24 || m < 0 || m > 59 {
+		return -1, false
+	}
+	return h*60 + m, true
+}
+
+// promoActive 评估优惠在 now 是否生效：enabled + validFrom/validUntil 内 + 落在
+// 任一 daily 窗口（支持跨午夜，如 23:00→7:50）。schedule 为 nil 视为全天生效。
+func promoActive(p *v3ModelPromotion, now time.Time) bool {
+	if !p.Enabled {
+		return false
+	}
+	if sc := p.Schedule; sc != nil {
+		if sc.ValidFrom != "" {
+			from, err := time.Parse(time.RFC3339, sc.ValidFrom)
+			if err == nil && now.Before(from) {
+				return false
+			}
+		}
+		if sc.ValidUntil != "" {
+			until, err := time.Parse(time.RFC3339, sc.ValidUntil)
+			if err == nil && !now.Before(until) {
+				return false
+			}
+		}
+		if len(sc.Daily) > 0 {
+			cur := now.Hour()*60 + now.Minute()
+			inWindow := false
+			for _, w := range sc.Daily {
+				st, ok1 := promoClock(w.Start)
+				ed, ok2 := promoClock(w.End)
+				if !ok1 || !ok2 {
+					continue
+				}
+				if st <= ed {
+					if cur >= st && cur < ed {
+						inWindow = true
+						break
+					}
+				} else if cur >= st || cur < ed { // 跨午夜（23:00→7:50）
+					inWindow = true
+					break
+				}
+			}
+			if !inWindow {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// applyModelPromotions 把当前生效的优惠挂到目录条目：同模型多条命中取 priority
+// 最高（实测 glm-5.2 白天 badge-only(50) 与夜间五折(100) 靠 priority+daily 双轨
+// 切换）。无 discount 对象的条目也挂标签/说明（错峰类），PromoFactor 留 nil。
+func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
+	if len(promos) == 0 || len(out) == 0 {
+		return
+	}
+	now := time.Now().In(promoZone)
+	type cand struct {
+		prio int
+		p    *v3ModelPromotion
+	}
+	best := map[string]cand{}
+	for i := range promos {
+		p := &promos[i]
+		if !promoActive(p, now) {
+			continue
+		}
+		for _, id := range p.ModelIDs {
+			if _, ok := out[id]; !ok {
+				continue // 目录外模型（如同名 global 变体）不挂
+			}
+			if b, seen := best[id]; !seen || p.Priority > b.prio {
+				best[id] = cand{prio: p.Priority, p: p}
+			}
+		}
+	}
+	for id, c := range best {
+		mi := out[id]
+		if c.p.Badge != nil {
+			mi.PromoLabel = c.p.Badge.Label
+		}
+		if c.p.Hover != nil {
+			mi.PromoNote = c.p.Hover.TextZh
+		}
+		if c.p.Discount != nil {
+			f := c.p.Discount.Factor
+			mi.PromoFactor = &f
+			mi.PromoCredits = c.p.Discount.DiscountedCredits
+		}
+		out[id] = mi
+	}
+}
+
 // fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
 // 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
-func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, error) {
+// ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对不同 UA 下发
+// **不同模型集合**（见 codeBuddyIDEUA 注释），global 探测据此并发两路取并集。
+func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
 		return nil, err
@@ -1438,7 +1600,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 	}
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("User-Agent", codeBuddyIDEUA)
+	if ua == "" {
+		ua = codeBuddyIDEUA
+	}
+	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -1457,6 +1622,19 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 		Code int `json:"code"`
 		Data struct {
 			Models []dynModelEntry `json:"models"`
+			// 试用模型横幅：上游把「N 天免费试用」的模型放在这里，**不在 data.models 里**。
+			// 实测 global 侧 hy4-preview-f 只出现在此（modelId=hy4-preview-f、
+			// targetModelId=hy4-preview、trialDays=14），纯 data.models 解析会漏掉它。
+			ProductFeaturesConfig struct {
+				ModelTrialBanner struct {
+					Banners []struct {
+						ModelID       string `json:"modelId"`
+						TargetModelID string `json:"targetModelId"`
+					} `json:"banners"`
+				} `json:"ModelTrialBanner"`
+			} `json:"productFeaturesConfig"`
+			// 限时优惠：折扣/标签/时段，按 now 评估后挂到对应模型条目（见 applyModelPromotions）。
+			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -1472,6 +1650,40 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 		}
 		out[m.ID] = m.modelInfo()
 	}
+	// 补入试用横幅模型（ModelTrialBanner）：上游把「N 天免费试用」的模型只放在这里，
+	// data.models 里没有，故纯目录解析会漏（实测 global 侧 hy4-preview-f 即如此，
+	// 但该模型**实际可调用**——下游能正常请求，只是 /v1/models 里没有、客户端选不到）。
+	//
+	// 元数据口径：能力字段（context/maxTokens/efforts/reasoning 等）从 targetModelId
+	// 的既有条目继承——试用版与其转正目标是同族模型，能力应当一致；
+	// 但 **Credits 与 Tags 显式清空**——它们描述的是「转正后」的计费与营销信息
+	// （如 hy4-preview 的 x0.29 与 badge），用在免费试用版上会误导下游展示。
+	//
+	// firstUseTimeKey / trialDays 属**账号级**试用状态，不透出给下游。
+	for _, b := range env.Data.ProductFeaturesConfig.ModelTrialBanner.Banners {
+		id := strings.TrimSpace(b.ModelID)
+		if id == "" {
+			continue
+		}
+		if _, exists := out[id]; exists {
+			continue
+		}
+		mi := ModelInfo{ID: id}
+		if tgt := strings.TrimSpace(b.TargetModelID); tgt != "" {
+			if base, ok := out[tgt]; ok {
+				mi = base
+				mi.ID = id
+			}
+		}
+		mi.Credits = ""
+		mi.Tags = nil
+		out[id] = mi
+	}
+	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准
+	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
+	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
+	applyModelPromotions(out, env.Data.ModelPromotions)
+
 	if len(out) == 0 {
 		return nil, fmt.Errorf("v3/config returned empty models")
 	}
