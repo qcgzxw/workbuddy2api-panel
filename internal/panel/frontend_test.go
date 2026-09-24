@@ -168,22 +168,13 @@ try {
 	}
 }
 
-// TestAddAccountTabsSwitch 「添加账号」弹窗的标签切换行为（真实执行 app.js）。
+// appJSHarness 执行 app.js 的 node 脚手架：搭最小 DOM（getElementById 返回可写
+// 元素对象，未登记的 id 落到 inert 万能桩），在 vm 上下文里跑 app.js，再把
+// process.env.ASSERT_SRC 作为第二段脚本在同一上下文执行——故断言脚本能直接调
+// app.js 的顶层函数、读到它的全局。
 //
-// 为什么不能只靠 Go 侧断言：标签切换与底部按钮可见性是**交互**逻辑，Go 测试读不到。
-// 这里给 node 一个带真实元素的最小 DOM（getElementById 返回可写对象），执行 app.js
-// 后调 openAdd/switchAddTab 并断言各元素的 hidden 状态。
-//
-// 重点覆盖：导入标签下必须隐藏三个登录动作按钮——否则点「获取授权链接」会写进
-// 隐藏面板里的 addReady，用户看不到任何反馈（静默失效）。
-func TestAddAccountTabsSwitch(t *testing.T) {
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node not installed; tab switch test skipped")
-	}
-	// harness 负责搭 DOM 与执行 app.js；断言脚本经环境变量传入（避免 Go 原始字符串
-	// 里嵌套反引号截断字面量），在同一个 vm 上下文里跑，故能直接调 app.js 的顶层函数。
-	harness := `const fs = require('fs');
+// 断言脚本走环境变量而非内联：Go 原始字符串里嵌反引号会截断字面量。
+const appJSHarness = `const fs = require('fs');
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const inert = new Proxy(function () {}, {
@@ -256,7 +247,39 @@ try {
   process.exit(1);
 }
 `
-	// 断言脚本在 app.js 的上下文里执行，故能直接调 openAdd / switchAddTab。
+
+// runInAppJS 在 app.js 的上下文里执行 assertSrc，返回 node 的合并输出与错误。
+// node 不可用时跳过测试（不阻塞无 Node 的构建机）。
+// 断言脚本约定：返回失败信息数组，非空即失败（脚手架据此打印并 exit 1）。
+func runInAppJS(t *testing.T, assertSrc string) (string, error) {
+	t.Helper()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS behavior test skipped")
+	}
+	hf, err := os.CreateTemp(t.TempDir(), "appjs-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hf.WriteString(appJSHarness); err != nil {
+		t.Fatal(err)
+	}
+	hf.Close()
+
+	cmd := exec.Command(node, hf.Name(), "app.js")
+	cmd.Dir = "." // 测试工作目录 = internal/panel
+	cmd.Env = append(os.Environ(), "ASSERT_SRC="+assertSrc)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// TestAddAccountTabsSwitch 「添加账号」弹窗的标签切换行为（真实执行 app.js）。
+//
+// 为什么不能只靠 Go 侧断言：标签切换与底部按钮可见性是**交互**逻辑，Go 测试读不到。
+//
+// 重点覆盖：导入标签下必须隐藏三个登录动作按钮——否则点「获取授权链接」会写进
+// 隐藏面板里的 addReady，用户看不到任何反馈（静默失效）。
+func TestAddAccountTabsSwitch(t *testing.T) {
 	assertSrc := `(function () {
   const f = [];
   const E = id => __els[id];
@@ -296,24 +319,62 @@ try {
   chk(on(0) === true && on(1) === false, 'openAdd 应复位标签高亮');
   return f;
 })()`
-
-	hf, err := os.CreateTemp(t.TempDir(), "tabs-*.cjs")
-	if err != nil {
-		t.Fatal(err)
+	out, err := runInAppJS(t, assertSrc)
+	if err != nil && !strings.Contains(out, "TAB FAIL") {
+		t.Fatalf("标签切换测试执行失败: %v\n%s", err, out)
 	}
-	if _, err := hf.WriteString(harness); err != nil {
-		t.Fatal(err)
-	}
-	hf.Close()
-
-	cmd := exec.Command(node, hf.Name(), "app.js")
-	cmd.Dir = "."
-	cmd.Env = append(os.Environ(), "ASSERT_SRC="+assertSrc)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("标签切换测试失败: %v\n%s", err, out)
-	}
-	if !bytes.Contains(out, []byte("TAB OK")) {
+	if !strings.Contains(out, "TAB OK") {
 		t.Fatalf("标签切换未通过:\n%s", out)
+	}
+}
+
+// TestRateCellPromoDisplay 倍率列的显示口径：牌价（credits）与生效价（promo_*）
+// 不能混为一谈——有折扣时生效价大字 + 标签 + 划线牌价；无 discount 的错峰类只挂
+// 标签；标签/说明一律经 esc 转义（promo_label/promo_note 来自上游，属不可信输入）。
+func TestRateCellPromoDisplay(t *testing.T) {
+	assertSrc := `(function () {
+  const f = [];
+  const chk = (cond, msg) => { if (!cond) f.push(msg); };
+
+  // 1. 限时免费（factor=0）：生效价大字 + 标签 + 划线牌价 + 悬停说明
+  const free = rateCell({ credits: 'x0.29', promo_factor: 0, promo_credits: '0x',
+    promo_label: '限时免费', promo_note: '新用户 14 天免费' });
+  chk(free.indexOf('<b>0x</b>') >= 0, '限时免费应大字显示生效价，got ' + free);
+  chk(free.indexOf('限时免费') >= 0, '限时免费应显示标签');
+  chk(free.indexOf('<s style') >= 0 && free.indexOf('x0.29') >= 0, '应划线显示牌价');
+  chk(free.indexOf('title="新用户 14 天免费"') >= 0, '应带悬停说明');
+
+  // 2. 折扣（factor=0.5）
+  const half = rateCell({ credits: 'x0.79', promo_factor: 0.5, promo_credits: '0.50x', promo_label: '夜间折扣' });
+  chk(half.indexOf('<b>0.50x</b>') >= 0, '折扣应大字显示生效价，got ' + half);
+  chk(half.indexOf('<s style') >= 0 && half.indexOf('x0.79') >= 0, '应划线显示牌价');
+
+  // 3. 错峰类（只有标签、无 discount）：牌价 + 标签，不得出现划线或大字生效价
+  const badge = rateCell({ credits: 'x0.03', promo_label: '错峰使用', promo_note: '每日 00:00-08:00' });
+  chk(badge.indexOf('x0.03') >= 0 && badge.indexOf('错峰使用') >= 0, '错峰类应显示牌价+标签，got ' + badge);
+  chk(badge.indexOf('<s style') < 0, '错峰类无折扣，不应划线牌价');
+  chk(badge.indexOf('<b>') < 0, '错峰类无生效价，不应大字');
+
+  // 4. 无优惠：只显示牌价
+  chk(rateCell({ credits: 'x0.05' }) === 'x0.05', '无优惠应只显示牌价');
+
+  // 5. 无优惠且无牌价：破折号占位
+  chk(rateCell({}) === '—', '两者皆无应显示破折号');
+
+  // 6. 上游文案必须转义（promo_label / promo_note 属不可信输入）
+  const evil = rateCell({ credits: 'x0.1', promo_factor: 0, promo_credits: '0x',
+    promo_label: '<img src=x onerror=alert(1)>', promo_note: '"><script>alert(2)</script>' });
+  chk(evil.indexOf('<img') < 0, 'promo_label 必须转义，got ' + evil);
+  chk(evil.indexOf('<script>') < 0, 'promo_note 必须转义，got ' + evil);
+  chk(evil.indexOf('&lt;') >= 0, '转义后应出现实体，got ' + evil);
+
+  return f;
+})()`
+	out, err := runInAppJS(t, assertSrc)
+	if err != nil && !strings.Contains(out, "TAB FAIL") {
+		t.Fatalf("rateCell 测试执行失败: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "TAB OK") {
+		t.Fatalf("rateCell 显示口径未通过:\n%s", out)
 	}
 }
