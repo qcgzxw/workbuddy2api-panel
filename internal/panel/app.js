@@ -587,14 +587,33 @@ $('cfgForm').onsubmit = async ev => {
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
   $('addVeil').classList.add('on');
-  // 重置到选域态：选域可见、加载/就绪/完成/错误全收，起始按钮亮起。
+  // 重置到登录标签的初始态：选域可见、加载/就绪/完成/错误全收。
   $('addPick').hidden = false;
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
-  $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
-  $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
+  $('importDone').hidden = true; $('importErr').hidden = true;
+  if ($('importFile')) $('importFile').value = '';
+  $('btnStartLogin').disabled = false;
   stopPoll();
+  switchAddTab('login'); // 收尾统一底部按钮可见性（此时 addReady 已复位）
 }
+
+/* 弹窗两个标签：浏览器登录 / 导入 JSON。底部三个动作按钮只属于登录流程，
+   故导入标签下全部隐藏——否则点「获取授权链接」会写进隐藏面板里的 addReady，
+   用户看不到任何反馈。回到登录标签时按 addReady 的实际状态还原（它就是
+   「授权链接已就绪」的单一事实来源，startAddLogin 置 false、完成/报错置 true）。 */
+function switchAddTab(tab) {
+  document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));  const login = tab === 'login';
+  $('addTabLogin').hidden = !login;
+  $('addTabImport').hidden = login;
+  const ready = !$('addReady').hidden;
+  $('btnStartLogin').hidden = !login || ready;
+  $('btnCopyUrl').hidden = !login || !ready;
+  $('btnOpenUrl').hidden = !login || !ready;
+}
+document.querySelectorAll('#addTabs .tab').forEach(b => {
+  b.onclick = () => switchAddTab(b.dataset.tab);
+});
 function startAddLogin() {
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
@@ -639,6 +658,32 @@ $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+
+// 批量导入：cockpit tools 导出的账号数组 JSON。走 api()（FormData 原样发出，
+// 不 JSON 序列化、不设 Content-Type，由浏览器补 multipart boundary）。
+if ($('importFile')) {
+  $('importFile').onchange = async () => {
+    const file = $('importFile').files[0];
+    if (!file) return;
+    $('importDone').hidden = true; $('importErr').hidden = true;
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const d = await api('import/cockpit', { method: 'POST', body: fd });
+      $('importDone').hidden = false;
+      $('importDone').textContent = '导入完成：成功 ' + d.imported + ' 个' +
+        (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '') +
+        (d.imported ? '（已载入账号池）' : '');
+      // 逐条原因只进控制台：几十条错误堆在弹窗里没法读，也把弹窗撑爆。
+      if (d.errors && d.errors.length) console.warn('import errors:', d.errors);
+      loadOverview(true);
+    } catch (e) {
+      $('importErr').hidden = false;
+      $('importErr').textContent = '导入失败：' + e.message;
+    }
+    $('importFile').value = ''; // 允许重复选同一个文件
+  };
+}
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
