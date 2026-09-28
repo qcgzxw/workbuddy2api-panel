@@ -77,7 +77,7 @@ func TestFlushLoadRoundtrip(t *testing.T) {
 	}
 	raw, _ := os.ReadFile(path)
 	var f file
-	if err := json.Unmarshal(raw, &f); err != nil || f.Version != 1 || len(f.Buckets) != 1 {
+	if err := json.Unmarshal(raw, &f); err != nil || f.Version != fileVersion || len(f.Buckets) != 1 {
 		t.Fatalf("落盘文件异常: err=%v buckets=%d", err, len(f.Buckets))
 	}
 }
@@ -106,5 +106,38 @@ func TestLifecycleFlush(t *testing.T) {
 	r.Stop()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("Stop 后应有落盘文件: %v", err)
+	}
+}
+
+// 版本 1 文件没有积分字段：按零值恢复，旧 Token 数据保持可见且不产生伪比例。
+func TestLoadLegacyWithoutCredit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	legacy := `{"version":1,"saved":"2026-09-28T00:00:00+08:00","buckets":[{"s":"h:2026-09-28T10","r":"cn","u":"u1","m":"glm-5.2","q":1,"p":42,"t":42}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := New(path)
+	s := r.Snapshot(0, nil)
+	if s.Totals.TotalTokens != 42 || s.Totals.CreditSamples != 0 || s.Totals.CreditsPer1KTokens != 0 {
+		t.Fatalf("legacy totals = %+v, want token-only history", s.Totals)
+	}
+	if len(s.Deductions) != 0 {
+		t.Fatalf("legacy deductions = %+v, want none without credit observation", s.Deductions)
+	}
+}
+
+// 小时桶折叠为日桶时必须保留积分、样本数和匹配 Token，比例不能因 Rollup 漂移。
+func TestCreditSurvivesRollup(t *testing.T) {
+	r := New("")
+	old := time.Now().AddDate(0, 0, -100)
+	r.Add(old, "cn", "u", "m", Delta{PromptTokens: 100, HasPromptTokens: true, TotalTokens: 100, HasTotal: true, Credit: 1.25, HasCredit: true}, true)
+	r.Add(old.Add(2*time.Hour), "cn", "u", "m", Delta{PromptTokens: 300, HasPromptTokens: true, TotalTokens: 300, HasTotal: true, Credit: 3.75, HasCredit: true}, true)
+	r.Rollup(time.Now())
+	s := r.Snapshot(0, nil)
+	if s.Totals.Credits != 5 || s.Totals.CreditSamples != 2 || s.Totals.CreditTokens != 400 || s.Totals.CreditsPer1KTokens != 12.5 {
+		t.Fatalf("rolled credit totals = %+v, want credits=5 tokens=400 ratio=12.5", s.Totals)
+	}
+	if len(s.Deductions) != 1 || s.Deductions[0].Scope != "day" || s.Deductions[0].CreditsPer1KToken != 12.5 {
+		t.Fatalf("rolled deductions = %+v, want one day row", s.Deductions)
 	}
 }
