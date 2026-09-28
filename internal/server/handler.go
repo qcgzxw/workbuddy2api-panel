@@ -22,6 +22,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -65,6 +66,9 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
+	RequestLog *reqlog.Recorder
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -138,6 +142,22 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+		r = r.WithContext(context.WithValue(r.Context(), requestTraceKey{}, trace))
+		obs := &responseObserver{ResponseWriter: w}
+		w.Header().Set("X-Request-Id", trace.id)
+		h.cfg.RequestLog.Begin()
+		defer func() {
+			status := obs.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			h.cfg.RequestLog.Record(trace.event(status))
+		}()
+		h.mux.ServeHTTP(obs, r)
+		return
+	}
 	h.mux.ServeHTTP(w, r)
 }
 
@@ -505,6 +525,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	if tr := requestTraceFrom(r); tr != nil {
+		tr.stat = st
+	}
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -570,6 +593,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 显式入参而不是读 st.ttfb：后者在流式分支里是**调用之后**才赋值的，
 	// 靠顺序传递会让将来重排代码时静默把速率算回旧的错口径。
 	recordAttempt := func(uid string, delta pool.TokenUsageDelta, credit float64, hasCredit bool, started time.Time, ttfb time.Duration) {
+		st.attempts++
+		if delta.HasPromptTokens {
+			st.promptTokens = delta.PromptTokens
+		}
+		if delta.HasCompletionTokens {
+			st.completionTokens = delta.CompletionTokens
+		}
+		if delta.HasTotalTokens {
+			st.totalTokens = delta.TotalTokens
+		} else if delta.HasPromptTokens || delta.HasCompletionTokens {
+			st.totalTokens = st.promptTokens + st.completionTokens
+		}
 		delta.Model = bareModel
 		if delta.Model == "" {
 			delta.Model = peek.Model
@@ -823,6 +858,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "content_blocked", msg,
 					h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
 			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
@@ -837,6 +873,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
 			// 图片格式/数据无效：立即透传上游原文回客户端，不罚号不轮转。
@@ -851,6 +888,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "image_invalid", msg,
 					h.hintOf(upstream.ErrImageInvalid, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
+				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
 			// 请求体解析失败（11101）：与 11115 / 图片无效同一哲学——同一 body 换任何
@@ -912,6 +950,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 只认 IsEmptyStreamError：客户端断连的写失败不误标（人已走，
 				// 502 观测没有意义）。
 				st.status = http.StatusBadGateway
+				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			case errFrame != "":
 				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
@@ -921,10 +960,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind := upstream.FrameKind(errFrame)
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
 				st.status = http.StatusServiceUnavailable
+				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
+				st.outcome = reqlog.OutcomeSuccess
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 				// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
@@ -964,12 +1005,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
+			st.outcome = reqlog.OutcomeHTTPError
 			return
 		}
 		credit, total, hasCredit := usageCreditTotal(resp)
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
+		st.outcome = reqlog.OutcomeSuccess
 		st.toks = completionTokens(resp)
 		// metrics 采集（非流式）：与流式同口径，从同一份 usage 带出。
 		fillStatFromUsage(st, resp)
@@ -1062,6 +1105,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
+	st.outcome = reqlog.OutcomeHTTPError
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
