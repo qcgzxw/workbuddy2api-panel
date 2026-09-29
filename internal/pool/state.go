@@ -541,6 +541,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Paused:                   e.paused,
 		SuccessCount:             e.successCount,
 		ErrTotal:                 e.errTotal,
+		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
 		TokenUsage:               e.tokenUsage,
 		LastSuccessTime:          e.lastSuccess,
 		LastErrTime:              e.lastErr,
