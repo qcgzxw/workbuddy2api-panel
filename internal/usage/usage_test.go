@@ -60,15 +60,23 @@ func TestRollupIdempotent(t *testing.T) {
 
 	r.Rollup(time.Now())
 	after := r.Snapshot(24, nil)
-	if after.Totals.Requests != 3 || after.Totals.PromptTokens != 15 {
-		t.Fatalf("折叠后 totals = %d/%d, want 3/15", after.Totals.Requests, after.Totals.PromptTokens)
+	if after.Totals.Requests != 1 || after.Totals.PromptTokens != 1 {
+		t.Fatalf("24h 窗口 totals = %d/%d, want 1/1（窗口外日桶不进聚合）", after.Totals.Requests, after.Totals.PromptTokens)
 	}
-	if len(after.Series) != 2 || after.Series[0].Scope != "day" || after.Series[1].Scope != "hour" {
-		t.Fatalf("series = %+v, want 日点在前 + 小时点在后", after.Series)
+	if len(after.Series) != 1 || after.Series[0].Scope != "hour" {
+		t.Fatalf("series = %+v, want 仅当前小时 1 个点", after.Series)
+	}
+
+	all := r.Snapshot(0, nil)
+	if all.Totals.Requests != 3 || all.Totals.PromptTokens != 15 {
+		t.Fatalf("全部历史 totals = %d/%d, want 3/15", all.Totals.Requests, all.Totals.PromptTokens)
+	}
+	if len(all.Series) != 2 || all.Series[0].Scope != "day" || all.Series[1].Scope != "hour" {
+		t.Fatalf("series = %+v, want 日点在前 + 小时点在后", all.Series)
 	}
 
 	r.Rollup(time.Now())
-	again := r.Snapshot(24, nil)
+	again := r.Snapshot(0, nil)
 	if again.Totals.Requests != 3 || again.Totals.PromptTokens != 15 {
 		t.Fatalf("二次折叠后 totals = %d/%d, want 3/15（幂等被破坏）", again.Totals.Requests, again.Totals.PromptTokens)
 	}
@@ -93,18 +101,31 @@ func TestFlushLoadRoundtrip(t *testing.T) {
 	}
 }
 
-// Snapshot 把小时窗口外的细粒度并入日点，时序不出现空洞。
-func TestSnapshotStitching(t *testing.T) {
+// Snapshot 全口径窗口过滤：窗口外的数据不进**任何**聚合（卡片/表格/时序），
+// 切窗口数字随之变化；hours=0 全部历史。Buckets 为窗口内命中的桶数。
+func TestSnapshotWindowFilter(t *testing.T) {
 	r := New("")
 	now := time.Now()
-	r.Add(now.Add(-48*time.Hour), "cn", "u", "m", Delta{PromptTokens: 5, HasPromptTokens: true}, true) // 窗口(24h)外 → 日点
-	r.Add(now, "cn", "u", "m", Delta{PromptTokens: 3, HasPromptTokens: true}, true)                    // 窗口内 → 小时点
+	r.Add(now.Add(-48*time.Hour), "cn", "u", "m", Delta{PromptTokens: 5, HasPromptTokens: true}, true) // 窗口(24h)外
+	r.Add(now, "cn", "u", "m", Delta{PromptTokens: 3, HasPromptTokens: true}, true)                    // 窗口内
 	s := r.Snapshot(24, nil)
-	if len(s.Series) != 2 || s.Series[0].Scope != "day" || s.Series[1].Scope != "hour" {
-		t.Fatalf("series = %+v", s.Series)
+	if s.Totals.Requests != 1 || s.Totals.PromptTokens != 3 {
+		t.Fatalf("24h 窗口 totals = %d/%d, want 1/3（48h 前的数据应被过滤）", s.Totals.Requests, s.Totals.PromptTokens)
 	}
-	if s.Series[0].PromptTokens != 5 || s.Series[1].PromptTokens != 3 {
-		t.Fatalf("series tokens = %d/%d, want 5/3", s.Series[0].PromptTokens, s.Series[1].PromptTokens)
+	if len(s.Series) != 1 || s.Series[0].Scope != "hour" || s.Series[0].PromptTokens != 3 {
+		t.Fatalf("series = %+v, want 仅窗口内 1 个小时点", s.Series)
+	}
+	if s.Buckets != 1 {
+		t.Fatalf("buckets = %d, want 1（窗口内命中桶数）", s.Buckets)
+	}
+
+	all := r.Snapshot(0, nil)
+	if all.Totals.Requests != 2 || all.Totals.PromptTokens != 8 {
+		t.Fatalf("全部历史 totals = %d/%d, want 2/8", all.Totals.Requests, all.Totals.PromptTokens)
+	}
+	// since 是全库数据起点，不受窗口影响。
+	if all.Since == "" || s.Since != all.Since {
+		t.Fatalf("since 应为全库起点且不随窗口变化: all=%q windowed=%q", all.Since, s.Since)
 	}
 }
 
@@ -190,5 +211,93 @@ func TestCreditLegacyRateFallback(t *testing.T) {
 	if len(s.CreditByModel) != 1 || s.CreditByModel[0].Rate != "0.79" ||
 		s.CreditByModel[0].Credits != 3 || s.CreditByModel[0].CreditTokens != 300 {
 		t.Fatalf("fallback model rows = %+v, want legacy merged into rate=0.79", s.CreditByModel)
+	}
+}
+
+// 显式区间（「今天」/「自定义」）与滚动窗口走同一套全口径过滤；区间是闭区间
+// （桶起点落在 [From, To] 内即命中），且 From/To 会回显给面板确认口径。
+func TestSnapshotExplicitWindow(t *testing.T) {
+	r := New("")
+	base := time.Now().Truncate(time.Hour).Add(-5 * time.Hour)
+	for i := 0; i < 6; i++ {
+		r.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u", "m",
+			Delta{PromptTokens: 10, HasPromptTokens: true}, true)
+	}
+	// 只取中间两小时（base+2h、base+3h）。
+	s := r.SnapshotWindow(Window{
+		From: base.Add(2 * time.Hour),
+		To:   base.Add(3 * time.Hour),
+	}, nil, nil)
+	if s.Totals.Requests != 2 || s.Totals.PromptTokens != 20 {
+		t.Fatalf("显式区间 totals = %d/%d, want 2/20", s.Totals.Requests, s.Totals.PromptTokens)
+	}
+	if len(s.Series) != 2 || s.Buckets != 2 {
+		t.Fatalf("显式区间 series/buckets = %d/%d, want 2/2", len(s.Series), s.Buckets)
+	}
+	if s.WindowFrom == "" || s.WindowTo == "" {
+		t.Fatalf("显式区间应回显 window_from/window_to: %+v", s)
+	}
+	if _, err := time.Parse(time.RFC3339, s.WindowFrom); err != nil {
+		t.Fatalf("window_from 不是 RFC3339: %q", s.WindowFrom)
+	}
+
+	// 只有 From（「今天」的形态）：从该点起到最新，全量命中。
+	only := r.SnapshotWindow(Window{From: base.Add(4 * time.Hour)}, nil, nil)
+	if only.Totals.Requests != 2 {
+		t.Fatalf("仅 From 的 totals = %d, want 2", only.Totals.Requests)
+	}
+	if only.WindowFrom == "" || only.WindowTo != "" {
+		t.Fatalf("仅 From 时 window_to 应为空: %+v", only)
+	}
+
+	// 空窗口（From/To 全零且 Hours<=0）= 全部历史，与 Snapshot(0) 等价。
+	all := r.SnapshotWindow(Window{}, nil, nil)
+	if all.Totals.Requests != 6 {
+		t.Fatalf("全零窗口 totals = %d, want 6（全部历史）", all.Totals.Requests)
+	}
+	if all.WindowFrom != "" || all.WindowTo != "" {
+		t.Fatalf("全部历史不应回显区间: %+v", all)
+	}
+}
+
+// 滚动窗口的上限仍是 60 天，且与显式区间互不干扰（From/To 优先）。
+func TestWindowBounds(t *testing.T) {
+	// From/To 优先于 Hours。
+	from := time.Now().Add(-2 * time.Hour)
+	gotFrom, gotTo := Window{Hours: 720, From: from}.bounds()
+	if !gotFrom.Equal(from) || !gotTo.IsZero() {
+		t.Fatalf("From 应优先于 Hours: from=%v to=%v", gotFrom, gotTo)
+	}
+	// 只有 Hours：起点 = 当前整点往回 Hours-1 小时。
+	f, to := Window{Hours: 24}.bounds()
+	want := time.Now().Truncate(time.Hour).Add(-23 * time.Hour)
+	if !f.Equal(want) || !to.IsZero() {
+		t.Fatalf("24h bounds = %v/%v, want %v/零值", f, to, want)
+	}
+	// Hours<=0 且无 From/To = 全部历史。
+	if f, to := (Window{}).bounds(); !f.IsZero() || !to.IsZero() {
+		t.Fatalf("空窗口 bounds = %v/%v, want 零值/零值", f, to)
+	}
+	// 上限 60 天。
+	f60, _ := Window{Hours: 100000}.bounds()
+	want60 := time.Now().Truncate(time.Hour).Add(-(24*60 - 1) * time.Hour)
+	if !f60.Equal(want60) {
+		t.Fatalf("超限 Hours 未被夹到 60 天: %v want %v", f60, want60)
+	}
+}
+
+// 脏 scope（解析失败）不进任何口径，也不会让整次快照失败。
+func TestBucketTimeRejectsGarbage(t *testing.T) {
+	if _, ok := bucketTime("h:not-a-time"); ok {
+		t.Fatal("脏小时 scope 应判定失败")
+	}
+	if _, ok := bucketTime("d:2026-13-45"); ok {
+		t.Fatal("脏日 scope 应判定失败")
+	}
+	if ts, ok := bucketTime("h:2026-09-30T13"); !ok || ts.Hour() != 13 {
+		t.Fatalf("合法小时 scope 解析失败: %v %v", ts, ok)
+	}
+	if ts, ok := bucketTime("d:2026-09-30"); !ok || ts.Day() != 30 {
+		t.Fatalf("合法日 scope 解析失败: %v %v", ts, ok)
 	}
 }
