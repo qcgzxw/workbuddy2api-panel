@@ -120,9 +120,9 @@ func recordChatMetric(s *chatStat, total time.Duration) {
 		if s.toks > 0 {
 			mm.compTok += int64(s.toks)
 		}
-		mm.cacheHit += int64(s.cacheHit)
-		mm.cacheMiss += int64(s.cacheMiss)
-		mm.cacheWrite += int64(s.cacheWr)
+		mm.cacheHit += s.cacheHit
+		mm.cacheMiss += s.cacheMiss
+		mm.cacheWrite += s.cacheWr
 		// 生成吞吐分母：总耗时减去 TTFB（纯生成时间）。TTFB 缺失时退回总耗时。
 		gen := totalMS
 		if s.ttfb > 0 {
@@ -297,7 +297,11 @@ func fillStatFromReader(st *chatStat, r *chatStatsReader) {
 	if d.HasPromptTokens {
 		st.prompt = int(d.PromptTokens)
 	}
-	st.cacheHit, st.cacheMiss, st.cacheWr = r.CacheTokens()
+	if hit, miss, ok := r.CacheTokens(); ok {
+		st.cacheHit, st.cacheMiss = hit, miss
+		st.hasCache = true
+	}
+	st.cacheWr = int64(r.cacheWr)
 	if c, ok := r.Credit(); ok {
 		st.credit = c
 		st.hasCredit = true
@@ -322,13 +326,13 @@ func fillStatFromUsage(st *chatStat, resp map[string]any) {
 		st.prompt = int(n)
 	}
 	if n, ok := usageInt(u, "prompt_cache_hit_tokens"); ok {
-		st.cacheHit = int(n)
+		st.cacheHit = n
 	}
 	if n, ok := usageInt(u, "prompt_cache_miss_tokens"); ok {
-		st.cacheMiss = int(n)
+		st.cacheMiss = n
 	}
 	if n, ok := usageInt(u, "prompt_cache_write_tokens"); ok {
-		st.cacheWr = int(n)
+		st.cacheWr = n
 	}
 	if c, ok := u["credit"].(float64); ok {
 		st.credit = c
