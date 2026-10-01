@@ -1792,8 +1792,9 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime / CycleEndTime
-	// 按优先级取首个有值字段）。
+	// EndTime 该包的失效时刻：优先 DeductionEndTime（可抵扣窗口结束，真「用不完
+	// 就没了」），缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime（周期
+	// 边界，仅兜底）。RFC3339 或上游墙钟字符串，前端取日期部分展示。
 	EndTime string `json:"end_time,omitempty"`
 	// ExpiresAt 与 EndTime 同源的 Unix 毫秒时间戳，供面板按精确剩余天数聚合。
 	ExpiresAt int64 `json:"expires_at,omitempty"`
@@ -1848,6 +1849,12 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
 					CycleEndTime   string `json:"CycleEndTime"`
+					// DeductionEndTime 可抵扣窗口结束（epoch 毫秒）——「这个包什么时候
+					// 不能再花」的真失效时刻。CycleEndTime 是周期边界（额度重置点），
+					// 两者语义不同：判「用不完就没了」以本字段为准，CycleEndTime 兜底
+					//（OkRoromori 分支实测结论：请求参数叫 PackageEndTimeRange*，但
+					// 响应里 ExpiredTime 恒空，真正的失效时刻只有这里下发）。
+					DeductionEndTime int64 `json:"DeductionEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -1871,6 +1878,11 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductName: p.SubProductName,
 		}
 		switch {
+		case p.DeductionEndTime > 0:
+			// 真失效时刻（可抵扣窗口结束），语义见上方字段注释：判「用不完就没了」
+			// 用它而不是周期边界。epoch 毫秒 → RFC3339，与 CycleEndTime 字符串口径
+			// 共存（前端统一 slice(0,10) 取日期）。
+			cp.EndTime = time.UnixMilli(p.DeductionEndTime).Format(time.RFC3339)
 		case p.ExpiredTime != "":
 			cp.EndTime = p.ExpiredTime
 		case p.PackageEndTime != "":
