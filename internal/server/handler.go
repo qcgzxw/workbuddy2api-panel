@@ -559,7 +559,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
-	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time) {
+	// ttfb 首 token 等待（仅流式有观测；非流式传 0 = 无观测，速率不扣减）。
+	// 显式入参而不是读 st.ttfb：后者在流式分支里是**调用之后**才赋值的，
+	// 靠顺序传递会让将来重排代码时静默把速率算回旧的错口径。
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time, ttfb time.Duration) {
 		delta.Model = peek.Model
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
@@ -568,9 +571,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		delta.HasLatencyMs = true
 		delta.LatencyMs = latencyMs
-		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 && latencyMs > 0 {
-			delta.HasTokensPerSecond = true
-			delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / float64(latencyMs)
+
+		// HasCompletionTokens 是「本次有没有 token 观测」的独立判断，与速率怎么算
+		// 无关，所以留在调用点；速率本身的边界（TTFB 缺失/超界）收在 tokensPerSecond。
+		if delta.HasCompletionTokens {
+			if tps, ok := tokensPerSecond(delta.CompletionTokens,
+				time.Duration(latencyMs)*time.Millisecond, ttfb); ok {
+				delta.HasTokensPerSecond = true
+				delta.TokensPerSecond = tps
+			}
 		}
 		h.cfg.Pool.RecordTokenUsage(uid, delta)
 
@@ -735,7 +744,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// **客户端仍在但 ctx 被取消**——那只能是我们自己的空闲看门狗掐的流，
 			// 也就是上游停滞。客户端主动断连时 r.Context() 已取消，走下面的抖动分支。
 			if isUpstreamTimeout(terr, r.Context().Err() != nil) {
-				recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 				st.status = http.StatusServiceUnavailable
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
 				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
@@ -746,7 +755,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
@@ -757,7 +766,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			st.status = status
 			var kind upstream.ErrKind
 			if uerr != nil {
@@ -907,7 +916,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.cfg.Session.Bind(sessKey, acct.UID)
 				}
 			}
-			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
+			recordAttempt(acct.UID, stats.Usage(), attemptStarted, stats.TTFB())
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -931,13 +940,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted)
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted, 0)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
@@ -997,6 +1006,37 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
+}
+
+// tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
+//
+// 分母用「生成耗时」= 端到端耗时 - 首 token 等待（TTFB），不是端到端耗时。
+//
+// 为什么要减：不减的话，首 token 等待越长、报告速率被压得越低。同一模型换个
+// 上游或网络，TTFB 从 0.3s 涨到 2s，速率能凭空掉一半——读起来像"模型变慢了"，
+// 其实只是排队久了。issue #34 报的正是这个，维护者也确认「速率计算时并没有减去
+// 首token到达时间」。
+//
+// ttfb<=0 表示没有观测：非流式回复天然没有「首个 data 帧」（日志里那一列记的是
+// "-"）。此时不猜、不扣——凭空假定一个 TTFB 会把分母推向零、把速率抬成虚高，
+// 比不扣更糟。只有真测到才扣。
+//
+// 同理，ttfb 不小于总耗时时（时钟粒度、或 TTFB 落在计时终点之后）退回端到端耗时，
+// 避免零/负分母。token 数为负哨兵值（-1 = 观测缺失）时返回 false。
+//
+// 用量账本（handler）与控制台流水行（logging.go）都走这一个函数：两处各算一遍时
+// 口径漂移过一次（流水行漏扣 TTFB、与面板数字对不上），共用是防再次分叉的唯一办法。
+func tokensPerSecond(completionTokens int64, total, ttfb time.Duration) (float64, bool) {
+	if completionTokens < 0 || total <= 0 {
+		return 0, false
+	}
+	gen := total
+	if ttfb > 0 {
+		if g := total - ttfb; g > 0 {
+			gen = g
+		}
+	}
+	return float64(completionTokens) / gen.Seconds(), true
 }
 
 // promptTooLongMessage 11115 透传 message：上游 body 原文（含真实 token 数/
