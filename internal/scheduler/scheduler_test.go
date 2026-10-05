@@ -193,6 +193,7 @@ func hasKind(kinds []taskKind, k taskKind) bool {
 type fakeUpstream struct {
 	checkinCalls   atomic.Int32
 	refreshCalls   atomic.Int32
+	travelCalls    atomic.Int32
 	resourceRemain int64
 	resourceEnd    string
 }
@@ -215,6 +216,13 @@ func (f *fakeUpstream) server() *httptest.Server {
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			f.refreshCalls.Add(1)
 			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/info"):
+			// 已领养（data.buddy 非空）：跳过领养前置，直接进旅行状态查询。
+			w.Write([]byte(`{"code":0,"data":{"buddy":{"id":1,"name":"cat"}}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/buddy/travel/status"):
+			// daily_limit_reached=true：状态查询计一次调用即止，不发 depart/claim。
+			f.travelCalls.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"state":"idle","daily_limit_reached":true}}`))
 		default:
 			http.Error(w, "not found", 404)
 		}
@@ -522,5 +530,26 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 	// u1（正常）+ u2（暂停）签到；u3（禁用）跳过 ⇒ 2 次
 	if got := f.checkinCalls.Load(); got != 2 {
 		t.Errorf("checkin calls=%d want 2（正常 + 暂停参与；禁用跳过）", got)
+	}
+}
+
+// TestPausedStillTravels 暂停号照常跑旅行：旅行是纯 RPC（状态/派出/领奖 +
+// 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的
+// 对话类任务只有夜猫子（RunNightChats 真实 ChatStream）。
+func TestPausedStillTravels(t *testing.T) {
+	f := &fakeUpstream{}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Pause("u2")
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	s.RunTravelNow()
+	if got := f.travelCalls.Load(); got != 2 {
+		t.Errorf("travel status calls=%d want 2（u1 + 暂停号 u2 照常旅行）", got)
 	}
 }
