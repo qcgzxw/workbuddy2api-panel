@@ -30,12 +30,10 @@ func TestGrowthPendingFiltersLocked(t *testing.T) {
 		t.Error("已领取任务不应入待办")
 	}
 
-	// ⚠️ 达标未领：此处钉的是**实际行为**（不入队），与紧邻的注释
-	// 「达标未领：也入队（队列执行后会自动领）」相反。
-	// 该矛盾自 ce717b7（2026-09-14 引入任务中心）起即存在，两个 fork 均未修正，
-	// 非本次改动引入。语义待定：若要按注释实现（改 return true），此断言需同步翻转。
-	if growthPending(upstream.Task{TaskCode: "chat_5", Target: 5, Current: 5}) {
-		t.Error("达标未领任务当前不入待办（与注释矛盾，见上）；若改为入队请同步此断言")
+	// 达标未领：入待办（队列执行后会自动领奖）——5f6c7ca 起按注释语义实现：
+	// 仅当任务登记了自动动作时才入队，否则队列执行时会因 autoActionFor 为 nil 报错。
+	if !growthPending(upstream.Task{TaskCode: "chat_5", Target: 5, Current: 5}) {
+		t.Error("达标未领（有自动动作）应入待办，以便队列自动领奖")
 	}
 
 	// 未登记动作的任务 → 不出待办（无法自动化）。
