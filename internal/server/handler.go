@@ -818,7 +818,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "bad_params", msg,
 					h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
-				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
