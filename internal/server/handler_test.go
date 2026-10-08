@@ -188,7 +188,6 @@ func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
 	}
 }
 
-
 func TestChatNonStreamAggregates(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz != "Bearer at1" {
