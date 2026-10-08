@@ -5,6 +5,7 @@ package pool
 import (
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -225,22 +226,20 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
 		}
 		e.credits -= d
-		consume := d
 		if e.creditsExpiring > 0 {
-			if consume > e.creditsExpiring {
-				consume = e.creditsExpiring
+			if d > e.creditsExpiring {
+				e.creditsExpiring = 0
+			} else {
+				e.creditsExpiring -= d
 			}
-			e.creditsExpiring -= consume
 		}
 		if e.creditsEarliestRemaining > 0 {
-			if consume > e.creditsEarliestRemaining {
-				consume = e.creditsEarliestRemaining
+			if d >= e.creditsEarliestRemaining {
+				e.creditsEarliestRemaining = 0
+				e.creditsEarliestExpiry = time.Time{}
+			} else {
+				e.creditsEarliestRemaining -= d
 			}
-			e.creditsEarliestRemaining -= consume
-		}
-		if e.creditsExpiring == 0 || e.creditsEarliestRemaining == 0 {
-			e.creditsEarliestExpiry = time.Time{}
-			e.creditsEarliestRemaining = 0
 		}
 	}
 	if e.modelCost == nil {
@@ -401,6 +400,8 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 		return nil
 	}
 	e.lastUsed = now
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
 	return e.a
 }
 
@@ -421,6 +422,8 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 		return nil
 	}
 	e.lastUsed = now
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
 	return e.a
 }
 
@@ -429,18 +432,37 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 // 注意：healthy 口径不含 inFlight 维度（是状态机权威判定，只看 disabled/until/breakerUntil）；
 // inFlightFull 是 healthy 的子集——healthy 里已达在途上限的账号数，供 /status 透出满载度。
 // 与 ServableNow 的区别见该函数注释。
+// 保持既有语义：paused 并入 disabled（= /status 的「不可用」口径）。监控/脚本只
+// 关心"还能不能用"，这个口径对它们是稳定契约，不因面板展示需要而改变。
+// 面板概况需要分开计数，用 CountsDetailedWithPaused。
 func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull int) {
+	t, h, c, d, pz, f := p.countsDetailedForRealm("")
+	return t, h, c, d + pz, f
+}
+
+// CountsDetailedWithPaused 同 CountsDetailed，但 paused 与 disabled 分开返回。
+//
+// 面板概况要回答「禁用几个、暂停几个」——暂停只关选号、照常签到保活，与禁用混成
+// 一个数字会让人误判池子的真实状况（issue #125）。
+func (p *Pool) CountsDetailedWithPaused() (total, healthy, cooling, disabled, paused, inFlightFull int) {
 	return p.countsDetailedForRealm("")
 }
 
 // CountsDetailedForRealm 同 CountsDetailed，但仅统计 Realm()==realm 的账号；
 // realm=="" 不加谓词（= CountsDetailed）。供 /status 按域分组透出。
 func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
-	return p.countsDetailedForRealm(realm)
+	t, h, c, d, pz, f := p.countsDetailedForRealm(realm)
+	return t, h, c, d + pz, f
 }
 
 // countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
-func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
+// countsDetailedForRealm 是共用遍历实现；realm=="" 不加谓词。
+//
+// paused 单独返回、不并进 disabled：调用方按自己的口径决定合不合并。
+// /status 要的是「还能不能用」（暂停与禁用同样不可选，合并）；面板概况要的是
+// 「禁用几个、暂停几个」（分开，issue #125）。两种口径都合理，所以把选择权
+// 留在调用方，而不是让一个共享函数替所有人做决定。
+func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, paused, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -450,10 +472,12 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 		}
 		total++
 		switch {
-		case e.disabled || e.paused:
-			// paused（暂停选号）与 disabled 同样不可选，合并计入 disabled 类
-			//（/status 的「不可用」口径）；细粒度区分由 Status.Paused 透出。
+		case e.disabled:
 			disabled++
+		case e.paused:
+			// 暂停选号：退出选号候选，但照常签到 / 活跃上报 / 保活 / 刷新余额。
+			// 它与「禁用」是两种运维状态，这里分开计；要不要合并由调用方决定。
+			paused++
 		case !e.healthy(now):
 			cooling++
 		default:
@@ -463,7 +487,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 			}
 		}
 	}
-	return total, healthy, cooling, disabled, inFlightFull
+	return total, healthy, cooling, disabled, paused, inFlightFull
 }
 
 // ServableNow 报告池当前是否可服务：存在至少一个 healthy 且未占满在途名额的账号。
@@ -524,6 +548,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
 		Realm:                    e.a.Realm(),
+		Enterprise:               e.a.IsEnterprise(),
 		Nickname:                 e.a.Nickname,
 		Remark:                   remark,
 		DisplayName:              displayName,
@@ -538,6 +563,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Paused:                   e.paused,
 		SuccessCount:             e.successCount,
 		ErrTotal:                 e.errTotal,
+		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
 		TokenUsage:               e.tokenUsage,
 		LastSuccessTime:          e.lastSuccess,
 		LastErrTime:              e.lastErr,
@@ -556,11 +582,24 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)
-		if st.CoolRemaining < 0 {
-			st.CoolRemaining = 0
+		// 常规冷却（until）与熔断期（breakerUntil）可能只有其一在生效，
+		// 取仍在未来且更晚截止的那个，避免仅熔断期时误报 0 / unknown。
+		remaining := int64(0)
+		if now.Before(e.until) {
+			if r := int64(time.Until(e.until).Seconds() + 0.999); r > remaining {
+				remaining = r
+			}
 		}
-		st.CoolKind = e.coolKind.String()
+		if now.Before(e.breakerUntil) {
+			if r := int64(time.Until(e.breakerUntil).Seconds() + 0.999); r > remaining {
+				remaining = r
+				st.CoolKind = "breaker"
+			}
+		}
+		st.CoolRemaining = remaining
+		if st.CoolKind == "" {
+			st.CoolKind = e.coolKind.String()
+		}
 	}
 	return st
 }
@@ -617,8 +656,13 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 	for _, m := range models {
 		mc := e.modelCooldowns[m]
 		if !mc.Until.IsZero() && now.Before(mc.Until) {
+			kind := "rate_limit"
+			if strings.HasPrefix(mc.Reason, "11102") {
+				kind = "model_unavailable"
+			}
 			row := RateLimitedModel{
 				Model:  m,
+				Kind:   kind,
 				Until:  mc.Until,
 				Reason: mc.Reason,
 			}

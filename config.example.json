@@ -3,8 +3,17 @@
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "panel": {
+    "package_detail_limit": 5
+  },
   "server": {
     "read_timeout": "300s"
+  },
+  "logging": {
+    "request_archive_enabled": true,
+    "request_retention_days": 7,
+    "request_archive_max_mb": 100,
+    "request_client_info": true
   },
   "telegram": {
     "enabled": false,
@@ -18,17 +27,20 @@
   },
   "schedule": {
     "checkin_hours": [9, 21],
+    "growth_hours": [1],
     "travel_hours": [9, 21],
     "activity_hours": [10],
     "keepalive_hours": [22],
     "blackcat_hours": [23],
     "checkin_enabled": true,
+    "growth_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
-    "balance_refresh_minutes": 5
+    "balance_refresh_minutes": 5,
+    "include_disabled_in_tasks": false
   },
   "global": {
     "enabled": true,

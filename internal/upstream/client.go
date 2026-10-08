@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -415,8 +416,16 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 	}
 	switch headerName {
 	case "Retry-After":
+		// 先做上限校验再乘 time.Second：16 位数字乘 1e9 会溢出 int64 回绕成
+		// 小正数，进而通过调用方的 retryAfterSanity 校验被当作合法等待时长。
+		if n > int64(retryAfterSanity/time.Second) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Second, true
 	case "Retry-After-Ms":
+		if n > int64(retryAfterSanity/time.Millisecond) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Millisecond, true
 	default: // X-Ratelimit-Reset：epoch → 剩余量
 		sec := n
@@ -638,7 +647,8 @@ type Client struct {
 	globalModels fetchGlobalModelsCache
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
-	SanitizeFingerprints bool
+	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
+	SanitizeFingerprints atomic.Bool
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
@@ -690,17 +700,18 @@ type Client struct {
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
 	tr := newTransport()
-	return &Client{
-		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		SanitizeFingerprints: true,
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
-		WebBaseCN:            "https://www.workbuddy.cn",
+	c := &Client{
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		ChatBaseCN:    "https://copilot.tencent.com",
+		BillingBaseCN: "https://www.codebuddy.cn",
+		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
 	}
+	c.SanitizeFingerprints.Store(true)
+	return c
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -794,7 +805,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -1781,9 +1792,12 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime / CycleEndTime
-	// 按优先级取首个有值字段）。
+	// EndTime 该包的失效时刻：优先 DeductionEndTime（可抵扣窗口结束，真「用不完
+	// 就没了」），缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime（周期
+	// 边界，仅兜底）。RFC3339 或上游墙钟字符串，前端取日期部分展示。
 	EndTime string `json:"end_time,omitempty"`
+	// ExpiresAt 与 EndTime 同源的 Unix 毫秒时间戳，供面板按精确剩余天数聚合。
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
 	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
 	// TCACA_code_007_*），只看名字无法区分，只有时间能说明它是不是账号首次授权那刻发的。
@@ -1835,6 +1849,12 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
 					CycleEndTime   string `json:"CycleEndTime"`
+					// DeductionEndTime 可抵扣窗口结束（epoch 毫秒）——「这个包什么时候
+					// 不能再花」的真失效时刻。CycleEndTime 是周期边界（额度重置点），
+					// 两者语义不同：判「用不完就没了」以本字段为准，CycleEndTime 兜底
+					//（OkRoromori 分支实测结论：请求参数叫 PackageEndTimeRange*，但
+					// 响应里 ExpiredTime 恒空，真正的失效时刻只有这里下发）。
+					DeductionEndTime int64 `json:"DeductionEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -1858,12 +1878,22 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductName: p.SubProductName,
 		}
 		switch {
+		case p.DeductionEndTime > 0:
+			// 真失效时刻（可抵扣窗口结束），语义见上方字段注释：判「用不完就没了」
+			// 用它而不是周期边界。epoch 毫秒 → RFC3339，与 CycleEndTime 字符串口径
+			// 共存（前端统一 slice(0,10) 取日期）。
+			cp.EndTime = time.UnixMilli(p.DeductionEndTime).Format(time.RFC3339)
 		case p.ExpiredTime != "":
 			cp.EndTime = p.ExpiredTime
 		case p.PackageEndTime != "":
 			cp.EndTime = p.PackageEndTime
 		default:
 			cp.EndTime = p.CycleEndTime
+		}
+		if cp.EndTime != "" {
+			if end, perr := time.ParseInLocation(packageEndLayout, cp.EndTime, softRateResetLoc); perr == nil {
+				cp.ExpiresAt = end.UnixMilli()
+			}
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
@@ -1933,10 +1963,110 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 	return remain, total, expiring, err
 }
 
+// enterpriseUnlimitedRemain / enterpriseUnlimitedTotal 企业版「不限量」在池内的等价表示
+// （上游 limitNum == -1；桌面端同判为 unlimited）。
+//
+// 池内没有"不限"状态位，而 credits 同时参与两处判定——路由权重（credits/maxCredits）与
+// credit_floor（余额低于阈值则不接收费模型）——不限量必须两处都"不构成限制"，故剩余量
+// 取一个足够大的值；total 记 -1 供面板显示「不限」。total 仅用于展示与快照，
+// 不参与任何判定（已核对全仓库引用面）。
+const (
+	enterpriseUnlimitedRemain int64 = 1 << 40
+	enterpriseUnlimitedTotal  int64 = -1
+)
+
+// enterpriseResource 查询**企业版账号**的分配额度，并归一到个人口径的
+// (remain, total, expiring, earliestAt, earliestRemaining)。
+//
+// 为什么必须分流：企业额度不在「个人资源包」体系内——/billing/meter/get-user-resource*
+// 对 enterpriseId 非空的账号恒返回空 Accounts（实测 code 0 且 Accounts null），
+// 面板因此长期显示 0/未知（额度其实是有的）。
+//
+// 上游口径（实测 2026-10-07，企业号 a6239ec8）：
+//
+//	POST /v2/billing/meter/get-enterprise-user-usage   （X-Enterprise-Id 由 BillingHeaders 注入）
+//	{"credit":812.45,"limitNum":2000,
+//	 "cycleStartTime":"2026-09-27 00:00:00","cycleEndTime":"2026-10-26 23:59:59",
+//	 "cycleResetTime":"2026-10-27 00:00:00"}
+//
+// credit = **本周期已用**（与个人口径 CapacityRemain「剩余」语义相反），
+// limitNum = **分配给本账号的额度**。故 remain = limitNum - credit、total = limitNum。
+// 注意：企业**池**总额度是另一回事，成员账号无权查询（实测所有池端点 403 not_authorized），
+// 本函数只反映该账号被分配的额度。
+//
+// 分桶：企业配额按周期重置、未用完即作废，与个人「奖励积分到期作废」同性质，故把
+// cycleEndTime 作为唯一到期批次——周期末企业号会被 prefer_expiring 优先选中（期望行为）。
+// limitNum < 0（不限量）无作废语义，不参与分桶。
+func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	// 与个人口径一致：余额是签到后的紧邻调用，偶发 500 值得有界重试。
+	var data json.RawMessage
+	err = c.retryBillingTransient(func() error {
+		var e error
+		data, e = c.billingJSON(a, http.MethodPost, "/v2/billing/meter/get-enterprise-user-usage", map[string]any{})
+		return e
+	})
+	if err != nil {
+		return 0, 0, 0, time.Time{}, 0, err
+	}
+	// 兼容上游两套字段命名（桌面端两条解析路径分别读 camelCase 与 snake_case）。
+	var resp struct {
+		Credit         float64 `json:"credit"`
+		LimitNum       int64   `json:"limitNum"`
+		LimitNumSnake  int64   `json:"limit_num"`
+		UsedNum        float64 `json:"used_num"`
+		CycleEndTime   string  `json:"cycleEndTime"`
+		CycleResetTime string  `json:"cycleResetTime"`
+	}
+	if uerr := json.Unmarshal(data, &resp); uerr != nil {
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource parse: %w", uerr)
+	}
+	limit := resp.LimitNum
+	if limit == 0 && resp.LimitNumSnake != 0 {
+		limit = resp.LimitNumSnake
+	}
+	used := resp.Credit
+	if used == 0 && resp.UsedNum != 0 {
+		used = resp.UsedNum
+	}
+	// 不限量：池内无对应状态位，用大剩余量让路由权重与 credit_floor 都不构成限制。
+	if limit < 0 {
+		return enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, 0, time.Time{}, 0, nil
+	}
+	// credit 是浮点（如 812.45），池内 credits 是整数：四舍五入到最近整数
+	// （向下取整会低报剩余额度，与"额度还有多少"的展示意图相悖）。
+	usedInt := int64(used)
+	if used-float64(usedInt) >= 0.5 {
+		usedInt++
+	}
+	remain = limit - usedInt
+	if remain < 0 {
+		remain = 0
+	}
+	total = limit
+	// 周期到期批次：cycleEndTime 优先，缺失回落 cycleResetTime。
+	now := time.Now()
+	end, ok := parsePackageEndTime(resp.CycleEndTime)
+	if !ok {
+		end, ok = parsePackageEndTime(resp.CycleResetTime)
+	}
+	if ok && remain > 0 && end.After(now) {
+		earliestAt, earliestRemaining = end, remain
+		if soon > 0 && !end.After(now.Add(soon)) {
+			expiring = remain
+		}
+	}
+	return remain, total, expiring, earliestAt, earliestRemaining, nil
+}
+
 // UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上返回最早未来到期批次：
 // earliestAt 是最早的可用到期时刻，earliestRemaining 是同一时刻所有正余额包的剩余量之和。
 // 已过期、剩余为 0、缺少或无法解析到期时间的包都不会成为最早批次；无有效批次时返回零值。
 func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
+	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
+	if a.IsEnterprise() {
+		return c.enterpriseResource(a, soon)
+	}
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1946,7 +2076,14 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
+	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
+	var data json.RawMessage
+	err = c.retryBillingTransient(func() error {
+		var e error
+		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+		return e
+	})
 	if err != nil {
 		return 0, 0, 0, time.Time{}, 0, err
 	}
@@ -2049,9 +2186,13 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
+// 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
+// 让该账号整天漏签；「已签到」等业务错误不重试。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-	return err
+	return c.retryBillingTransient(func() error {
+		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+		return err
+	})
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。

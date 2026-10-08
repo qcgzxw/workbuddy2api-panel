@@ -22,6 +22,67 @@ func TestDefault(t *testing.T) {
 	}
 }
 
+func TestPanelPackageDetailLimit(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Panel.PackageDetailLimit != 5 {
+		t.Fatalf("default package_detail_limit=%d want 5", c.Panel.PackageDetailLimit)
+	}
+
+	configured, err := ParseConfig([]byte(`{"panel":{"package_detail_limit":8}}`))
+	if err != nil {
+		t.Fatalf("parse configured limit: %v", err)
+	}
+	if configured.Panel.PackageDetailLimit != 8 {
+		t.Fatalf("configured package_detail_limit=%d want 8", configured.Panel.PackageDetailLimit)
+	}
+
+	fallback, err := ParseConfig([]byte(`{"panel":{"package_detail_limit":0}}`))
+	if err != nil {
+		t.Fatalf("parse fallback limit: %v", err)
+	}
+	if fallback.Panel.PackageDetailLimit != 5 {
+		t.Fatalf("fallback package_detail_limit=%d want 5", fallback.Panel.PackageDetailLimit)
+	}
+}
+
+func TestLoggingDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Logging.RequestArchiveEnabled || c.Logging.RequestRetentionDays != 7 || c.Logging.RequestArchiveMaxMB != 100 {
+		t.Fatalf("logging defaults = %+v", c.Logging)
+	}
+	// 来源记录（IP/UA）缺省开启：键缺席时必须保持 true，只有显式 false 才关闭。
+	if !c.Logging.RequestClientInfo {
+		t.Fatalf("request_client_info default = false, want true: %+v", c.Logging)
+	}
+	configured, err := ParseConfig([]byte(`{"logging":{"request_archive_enabled":false,"request_retention_days":30,"request_archive_max_mb":500}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured.Logging.RequestArchiveEnabled || configured.Logging.RequestRetentionDays != 30 || configured.Logging.RequestArchiveMaxMB != 500 {
+		t.Fatalf("configured logging = %+v", configured.Logging)
+	}
+	off, err := ParseConfig([]byte(`{"logging":{"request_client_info":false}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.Logging.RequestClientInfo {
+		t.Fatalf("explicit false ignored: %+v", off.Logging)
+	}
+	fallback, err := ParseConfig([]byte(`{"logging":{"request_retention_days":0,"request_archive_max_mb":0}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.Logging.RequestRetentionDays != 7 || fallback.Logging.RequestArchiveMaxMB != 100 {
+		t.Fatalf("logging fallback = %+v", fallback.Logging)
+	}
+}
+
 func TestLoadFile(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")

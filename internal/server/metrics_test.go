@@ -29,7 +29,7 @@ func TestMetricsAggregatesByModel(t *testing.T) {
 			model: "global:deepseek-v4.1-flash", mode: mode, status: status,
 			ttfb: time.Duration(ttfbMS) * time.Millisecond,
 			toks: toks, hasUsage: true, prompt: prompt,
-			cacheHit: hit, cacheMiss: miss, cacheWr: wr,
+			cacheHit: int64(hit), cacheMiss: int64(miss), cacheWr: int64(wr),
 			credit: credit, hasCredit: true,
 		}
 	}
