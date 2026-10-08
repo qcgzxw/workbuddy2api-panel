@@ -1,4 +1,4 @@
-// Package pool 账号池：单一状态机（健康/冷却/熔断/连败降权）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
+// Package pool 账号池：单一状态机（健康/冷却/熔断/连败降权）+ 在途租约 + 最早到期优先/加权挑选 + state.json 持久化。
 package pool
 
 import (
@@ -61,27 +61,38 @@ type TokenUsageDelta struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID           string    `json:"uid"`
-	Nickname      string    `json:"nickname,omitempty"`
-	Remark        string    `json:"remark,omitempty"`
-	DisplayName   string    `json:"display_name,omitempty"`
-	Credits       int64     `json:"credits"`
-	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
-	Cooling       bool      `json:"cooling"`
-	CoolKind      string    `json:"cool_kind,omitempty"`
-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
-	Until         time.Time `json:"until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	UID          string `json:"uid"`
+	Nickname     string `json:"nickname,omitempty"`
+	Remark       string `json:"remark,omitempty"`
+	DisplayName  string `json:"display_name,omitempty"`
+	Credits      int64  `json:"credits"`
+	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中
+	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
+	// 最早的一批及其剩余量，供 WorkDaddy 同口径的“最早到期优先”路由使用。
+	CreditsExpiring          int64     `json:"credits_expiring,omitempty"`
+	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitempty"`
+	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
+	Cooling                  bool      `json:"cooling"`
+	CoolKind                 string    `json:"cool_kind,omitempty"`
+	CoolRemaining            int64     `json:"cool_remaining_sec,omitempty"`
+	Until                    time.Time `json:"until,omitempty"`
+	Reason                   string    `json:"reason,omitempty"`
+	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	Realm          string `json:"realm,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
+	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
+	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
+	// 账号本身健康，只是暂不接流量。
+	Paused          bool       `json:"paused,omitempty"`
 	SuccessCount    int64      `json:"success_count,omitempty"`
 	ErrTotal        int64      `json:"err_total,omitempty"`
 	LastSuccessTime time.Time  `json:"last_success,omitempty"`
@@ -145,6 +156,10 @@ type modelCooldown struct {
 	Reason string
 	// Hits 11102 负缓存的累计命中次数（驱动指数退避）。6004 条目 Hits 恒 0。
 	Hits int
+	// AuditOnly 为 true 时仅用于状态展示（例如无重置时间的 6004），不参与选号
+	// 拦截（modelCooled 返回 false）。当前 main 尚无写入方（面板「模型锁池」视图
+	// 未吸收），字段先落位以对齐上游 modelCooled 口径。
+	AuditOnly bool
 }
 
 // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
@@ -162,21 +177,26 @@ type entry struct {
 	a            *auth.Auth
 	credits      int64
 	creditsTotal int64 // 积分总额度（UserResource 聚合；0 = 未知）
-	// creditsExpiring 即将过期（签到时按 expiring_soon 窗口判定）的可用积分子集，
-	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
-	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废。
-	// 运行态，签到/余额刷新时更新，不单独持久化（credits 仍持总量）。
-	creditsExpiring int64
-	successCount    int64      // 累计成功
-	errTotal        int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr         time.Time  // 最近一次错误时间
-	lastSuccess     time.Time  // 最近一次成功时间
-	tokenUsage      TokenUsage // 聊天请求 token 用量摘要（持久化）
-	coolKind        CoolKind
-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled        bool
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// creditsExpiring 配置窗口内即将过期的可用积分子集，是 credits 的一部分。
+	// creditsEarliestExpiry / creditsEarliestRemaining 是全部未来到期批次中的最早一批；
+	// 两者均由签到/余额刷新更新，供 earliest-expiry 路由和状态观测使用。
+	creditsExpiring          int64
+	creditsEarliestExpiry    time.Time
+	creditsEarliestRemaining int64
+	successCount             int64      // 累计成功
+	errTotal                 int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr                  time.Time  // 最近一次错误时间
+	lastSuccess              time.Time  // 最近一次成功时间
+	tokenUsage               TokenUsage // 聊天请求 token 用量摘要（持久化）
+	coolKind                 CoolKind
+	until                    time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled                 bool
+	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
+	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
+	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
+	paused   bool
+	reason   string
+	lastUsed time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -246,7 +266,7 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 // 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
 // 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
 func (e *entry) healthy(now time.Time) bool {
-	if e.disabled {
+	if e.disabled || e.paused {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -268,7 +288,7 @@ func (e *entry) healthy(now time.Time) bool {
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
 	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && e.breakerUntil.IsZero()
+		!e.disabled && !e.paused && e.breakerUntil.IsZero()
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -278,7 +298,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 		return false
 	}
 	mc, ok := e.modelCooldowns[reqModel]
-	if !ok {
+	if !ok || mc.AuditOnly {
 		return false
 	}
 	return !mc.Until.IsZero() && now.Before(mc.Until)
@@ -294,7 +314,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	if e.disabled {
+	if e.disabled || e.paused {
 		return false
 	}
 	if e.modelCooled(now, reqModel) {
@@ -384,6 +404,7 @@ type stateAccount struct {
 	Credits      int64     `json:"credits"`
 	CreditsTotal int64     `json:"credits_total,omitempty"`
 	Disabled     bool      `json:"disabled"`
+	Paused       bool      `json:"paused,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
 	Until        time.Time `json:"until,omitempty"`
 	CoolKind     CoolKind  `json:"cool_kind"`
@@ -415,9 +436,13 @@ type stateAccount struct {
 	// RetryCount 已熔断次数（指数退避的指数）。持久化以保留"越熔越长"的退避累积——
 	// 重启归零会让反复熔断只从最小退避开始。恢复时若 BreakerUntil 已过期则归零。
 	RetryCount int `json:"retry_count,omitempty"`
-	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留第四因子
-	// （weightOf 快过期积分加成）的偏好——重启后到下次签到之间不应失忆。
+	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留到期路由
+	// （最早到期路由）的偏好——重启后到下次签到之间不应失忆。
 	CreditsExpiring int64 `json:"credits_expiring"`
+	// CreditsEarliestExpiry / CreditsEarliestRemaining 最早未来到期批次及剩余量。
+	// 与 CreditsExpiring 一并持久化，重启后首次请求仍可沿用最近一次余额快照。
+	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitempty"`
+	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
 	// ModelCooldowns 模型级独立冷却表（model → 冷却记录：6004 重置墙钟 / 11102
 	// 负缓存退避）。持久化：6004 对齐上游重置墙钟后单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩雷区。

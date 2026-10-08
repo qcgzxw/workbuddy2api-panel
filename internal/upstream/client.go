@@ -34,7 +34,7 @@ const (
 	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
@@ -586,8 +586,9 @@ func Classify(status int, body string) ErrKind {
 		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
 		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
 		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
-		// 模型权限，值得再试一次）。
+		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
+		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
+		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
 		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
 			return ErrBadParams
 		}
@@ -627,6 +628,10 @@ type Client struct {
 	// thinking.go 补档：缺显式 effort 时优先用模型声明默认档，空串回退硬编码 high。
 	// 与 efforts 同 realm 分层桶（同 C-2 隔离原则），共用 effortsMu。
 	defaultEfforts map[string]map[string]string
+	// modelRates 缓存各模型当前生效积分倍率（规范化数值，如 "0.5"）。
+	// 与 efforts 共用 realm 分层和锁；每次成功刷新模型目录时整体替换对应域。
+	// 供积分保底的目录兜底判据（pool.SetModelRateOf → ModelRate）。
+	modelRates map[string]map[string]string
 
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
@@ -1180,7 +1185,13 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 // 来源：harness buddy.ts:547-555。三类规则：
 //   - id 前缀 nes-/completion-/codewise-：嵌入/补全/代码专用模型，选了报 code=11102。
 //   - maxOutputTokens ≤ 256：tiny 输出非对话模型。
-//   - tags 含 text-to-image：图片生成模型，非本网关用途。
+//   - tags 含生成类标签（图片/视频）：生成模型走各自专用端点，作为对话模型
+//     选上去只会报 11102，非本网关用途。
+//
+// 生成类标签随上游扩充：早期只有 text-to-image，桌面端目录（2026-10-02 实测）
+// 另有 text-to-video / image-to-video（seedance 系列）与 image-to-image
+// （gpt-image 系列）——后者已由 text-to-image 覆盖，此处补齐视频两类。
+// 注意本函数 CN 与 global 共用，新增标签对两域同时生效。
 func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	id = strings.ToLower(strings.TrimSpace(id))
 	for _, p := range [...]string{"nes-", "completion-", "codewise-"} {
@@ -1192,7 +1203,8 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 		return true
 	}
 	for _, t := range tags {
-		if t == "text-to-image" {
+		switch t {
+		case "text-to-image", "image-to-image", "text-to-video", "image-to-video":
 			return true
 		}
 	}
@@ -1257,6 +1269,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
+	c.storeModelRates(a.Realm(), out)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶。
 	cache := make(map[string][]string, len(out))
@@ -1420,6 +1433,71 @@ func (c *Client) storeEfforts(realm string, efforts map[string][]string, defs ma
 	}
 	c.efforts[k] = efforts
 	c.defaultEfforts[k] = defs
+}
+
+// normalizeModelRate 把上游倍率原文规范化为可比较的数值键。
+// 兼容 "x0.05" / "x0.05 credits" / "0.50x" 等形态；无法数值化时保留去除
+// credits 后缀与空白后的原文，避免编造倍率。
+func normalizeModelRate(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if strings.HasSuffix(strings.ToLower(s), "credits") {
+		s = strings.TrimSpace(s[:len(s)-len("credits")])
+	}
+	if strings.HasPrefix(strings.ToLower(s), "x") {
+		s = strings.TrimSpace(s[1:])
+	} else if strings.HasSuffix(strings.ToLower(s), "x") {
+		s = strings.TrimSpace(s[:len(s)-1])
+	}
+	if s == "" {
+		return ""
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return strings.TrimSpace(raw)
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// effectiveModelRate 返回模型当前生效倍率：有机器可读优惠时取折扣价，
+// 否则取牌价；两者均缺省时为空。
+func effectiveModelRate(mi ModelInfo) string {
+	if mi.PromoFactor != nil && strings.TrimSpace(mi.PromoCredits) != "" {
+		return normalizeModelRate(mi.PromoCredits)
+	}
+	return normalizeModelRate(mi.Credits)
+}
+
+// storeModelRates 按 realm 整体替换模型倍率快照。目录成功刷新但没有可解析
+// 倍率时写入空桶，使旧倍率不会继续冒充当前价。
+func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
+	rates := make(map[string]string, len(infos))
+	for _, mi := range infos {
+		if mi.ID == "" {
+			continue
+		}
+		if rate := effectiveModelRate(mi); rate != "" {
+			rates[mi.ID] = rate
+		}
+	}
+	c.effortsMu.Lock()
+	defer c.effortsMu.Unlock()
+	if c.modelRates == nil {
+		c.modelRates = make(map[string]map[string]string)
+	}
+	c.modelRates[realmKey(realm)] = rates
+}
+
+// ModelRate 返回最近成功刷新的指定域模型生效倍率；未知返回空串。
+func (c *Client) ModelRate(realm, model string) string {
+	if c == nil || model == "" {
+		return ""
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	return c.modelRates[realmKey(realm)][model]
 }
 
 // GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），
@@ -1703,7 +1781,8 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime 二者取有值者）。
+	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime / CycleEndTime
+	// 按优先级取首个有值字段）。
 	EndTime string `json:"end_time,omitempty"`
 	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
 	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
@@ -1750,9 +1829,12 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
 					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
 					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					// 到期时间字段名在上游同时存在两种口径，都读，谁有值用谁。
+					// 到期时间字段名在上游存在三种口径：ExpiredTime / PackageEndTime
+					// 在 CN/global 实测字段全集里均恒 miss（见 UserResourceDetailed
+					// 处注释），真实下发的是 CycleEndTime——三者都读，谁有值用谁。
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
+					CycleEndTime   string `json:"CycleEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -1775,10 +1857,13 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductCode: p.SubProductCode,
 			SubProductName: p.SubProductName,
 		}
-		if p.ExpiredTime != "" {
+		switch {
+		case p.ExpiredTime != "":
 			cp.EndTime = p.ExpiredTime
-		} else {
+		case p.PackageEndTime != "":
 			cp.EndTime = p.PackageEndTime
+		default:
+			cp.EndTime = p.CycleEndTime
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
@@ -1818,6 +1903,19 @@ func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
 // packageEndLayout 上游套餐到期时间的墙钟格式（UTC+8，与 softRateResetLoc 同口径）。
 const packageEndLayout = "2006-01-02 15:04:05"
 
+// parsePackageEndTime 统一解析上游套餐到期时间。空值、格式异常返回 false，
+// 调用方据此保守地不把该包计入最早到期路由。
+func parsePackageEndTime(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	t, err := time.ParseInLocation(packageEndLayout, raw, softRateResetLoc)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
 // soon > 0 且套餐 CycleEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
 // （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
@@ -1831,6 +1929,14 @@ const packageEndLayout = "2006-01-02 15:04:05"
 // 钳 [0,size] 与 used 修正；消除双份逻辑漂移——旧中间 switch 只钳负值，上游脏数据
 // CycleRemain>Size 时会高估）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
+	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(a, soon)
+	return remain, total, expiring, err
+}
+
+// UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上返回最早未来到期批次：
+// earliestAt 是最早的可用到期时刻，earliestRemaining 是同一时刻所有正余额包的剩余量之和。
+// 已过期、剩余为 0、缺少或无法解析到期时间的包都不会成为最早批次；无有效批次时返回零值。
+func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1842,7 +1948,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 	}
 	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, time.Time{}, 0, err
 	}
 	var resp struct {
 		Response struct {
@@ -1861,7 +1967,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("resource parse: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {
 		r, _, size := packageRemainUsed(respAccount{
@@ -1880,16 +1986,25 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		}
 		remain += r
 		total += size
-		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → expiring。
-		if soon > 0 && r > 0 && acct.CycleEndTime != "" {
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc); perr == nil {
-				if !end.After(now.Add(soon)) {
-					expiring += r
-				}
-			}
+		if r <= 0 {
+			continue
+		}
+		end, ok := parsePackageEndTime(acct.CycleEndTime)
+		if !ok || !end.After(now) {
+			continue
+		}
+		if earliestAt.IsZero() || end.Before(earliestAt) {
+			earliestAt = end
+			earliestRemaining = r
+		} else if end.Equal(earliestAt) {
+			earliestRemaining += r
+		}
+		// 分桶：仅 soon>0 且确实在窗口内 → expiring。
+		if soon > 0 && !end.After(now.Add(soon)) {
+			expiring += r
 		}
 	}
-	return remain, total, expiring, nil
+	return remain, total, expiring, earliestAt, earliestRemaining, nil
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（CreditPackages 的逐包结构同构）。

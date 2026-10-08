@@ -18,24 +18,53 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 	}
 }
 
-// SetCreditsDetailed 更新账号余额/总额 + 快过架子集（签到与余额刷新时调用，
-// 供选号优先消耗快过期积分）。expiring 会被钳到 [0, credits]：上游分桶异常时
-// 不污染权重。
-func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
+// SetCreditsDetailed 更新账号余额/总额、配置窗口内的快过架子集，以及最早未来
+// 到期批次。earliestAt 为零或不在未来时清空最早批次；expiring/earliestRemaining
+// 均钳到 [0, credits]，避免上游脏数据污染选号。
+func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, earliestAt time.Time, earliestRemaining int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
+		if credits < 0 {
+			credits = 0
+		}
 		if expiring < 0 {
 			expiring = 0
 		}
 		if expiring > credits {
 			expiring = credits
 		}
+		now := time.Now()
+		if earliestRemaining < 0 {
+			earliestRemaining = 0
+		}
+		if earliestRemaining > credits {
+			earliestRemaining = credits
+		}
+		if earliestAt.IsZero() || !earliestAt.After(now) || earliestRemaining == 0 {
+			earliestAt = time.Time{}
+			earliestRemaining = 0
+		}
 		e.credits = credits
 		e.creditsTotal = total
 		e.creditsExpiring = expiring
+		e.creditsEarliestExpiry = earliestAt
+		e.creditsEarliestRemaining = earliestRemaining
 		p.dirty.Store(true)
 	}
+}
+
+// ClearExpiringSnapshots 清空所有账号的快过期/最早到期缓存。配置窗口改变时调用，
+// 避免在新快照写入前继续使用旧窗口得到的路由数据；下一次签到或余额刷新会重建。
+func (p *Pool) ClearExpiringSnapshots() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.byUID {
+		e.creditsExpiring = 0
+		e.creditsEarliestExpiry = time.Time{}
+		e.creditsEarliestRemaining = 0
+	}
+	p.dirty.Store(true)
 }
 
 // Cooldown 冷却账号至 now+d（即时冷却：CoolHard 余额耗尽 / CoolSoft 固定短冷却）。
@@ -180,6 +209,64 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	p.dirty.Store(true)
 }
 
+// ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
+type ModelBlockStatus struct {
+	Blocked bool      // true = 每个非禁用账号都对该模型处于冷却中
+	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
+	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
+	Count   int       // 因此被挡的账号数
+}
+
+// ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
+//
+// 为什么需要它：选号失败时客户端只会拿到 no_healthy_account（"没有可用账号"），
+// 但真实原因常常是「号都在、只是都对这个模型关闭」。两者对调用方的处置完全不同
+// ——前者该等，后者换个模型才有用——此前却无法区分：首次请求还能看到上游原文
+// （lastErr 非空），一旦负缓存写入，后续请求 lastErr 为空，就只剩"池子没号"
+// （issue #102 附带发现 1）。上游原文与解封时间在那里被丢掉。
+//
+// 跨 realm 判定：调用方失败前已依次尝试过各域，所以只要有**任意**账号还能服务该
+// 模型，就不能算全池阻塞 —— 此时返回 Blocked=false，让上层继续用原有的
+// no_healthy_account 文案（选号失败另有原因：在途占满/积分保底/账号级冷却）。
+//
+// 口径必须与选号一致：用 modelCooled 而非直接查 map，这样 AuditOnly 条目
+// （只审计不拦截）不会被误报成阻塞。
+func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
+	if model == "" {
+		return ModelBlockStatus{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+
+	var st ModelBlockStatus
+	for _, e := range p.byUID {
+		if e.disabled {
+			continue // 禁用号不参与：它的不可用与模型无关
+		}
+		if !e.modelCooled(now, model) {
+			// 还有账号能服务这个模型 → 不是模型级阻塞。
+			return ModelBlockStatus{}
+		}
+		st.Count++
+		if mc, ok := e.modelCooldowns[model]; ok {
+			if st.Reason == "" {
+				st.Reason = mc.Reason
+			}
+			// 取最早解封：那才是"再等多久值得重试"的答案。
+			if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
+				st.Until = mc.Until
+			}
+		}
+	}
+	if st.Count == 0 {
+		// 池里压根没有非禁用账号：这是"真的没号"，不是模型问题。
+		return ModelBlockStatus{}
+	}
+	st.Blocked = true
+	return st
+}
+
 // CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。
 //
 // 语义：
@@ -300,6 +387,9 @@ func nextDay4AM(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
+// ReenableIfCredits 签到/余额刷新后解冻：仅当 remain > 0 且账号非禁用时，解冻
+// **余额耗尽冷却**（CoolHard）。软限流（CoolSoft）与模型级台账（modelCooldowns）
+// 不在此清除——它们的恢复证据是上游重置墙钟到期，不是余额恢复（余额刷新周期
+// 任务每 5 分钟到达这里，全清会把限流冷却实际寿命压到一个刷新周期内）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
 // reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。

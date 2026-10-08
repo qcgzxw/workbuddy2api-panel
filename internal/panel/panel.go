@@ -39,10 +39,10 @@ type Config struct {
 	Scheduler    *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	VoucherStore *voucher.Store
 	Notifier     *notify.Notifier
-	AuthDir      string               // OAuth 登录完成后凭证落盘目录
-	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
-	RedisMode string               // "upstash" / "noop"，仅观测透出
-	Version   string               // 面板版本号（展示用）
+	AuthDir      string // OAuth 登录完成后凭证落盘目录
+	APIKey       string // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
+	RedisMode    string // "upstash" / "noop"，仅观测透出
+	Version      string // 面板版本号（展示用）
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -165,6 +165,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remark", p.withAuth(p.accountRemark))
@@ -222,6 +224,14 @@ func (p *Panel) apiKey() string {
 		return p.cfg.Live.Load().APIKey
 	}
 	return p.cfg.APIKey
+}
+
+// expiringSoonWindow 返回调度器当前生效的快过期路由窗口；测试面板无调度器时返回 0。
+func (p *Panel) expiringSoonWindow() time.Duration {
+	if p.cfg.Scheduler == nil {
+		return 0
+	}
+	return p.cfg.Scheduler.ExpiringSoonWindow()
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +437,30 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// accountPause 暂停选号：账号退出选号候选，但**照常参与**签到 / 活跃上报 / 保活 /
+// 余额刷新。与 disable 的区别：不写 reason、不清冷却域、不重置计数——账号是「临时
+// 让位」而非「判死」，点「恢复选号」即可立刻回到池子（无需重登或解冻）。
+func (p *Panel) accountPause(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.Pause(uid) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: pause uid=%s（暂停选号，保号任务照常）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountResume 解除暂停选号（幂等，对未暂停账号为空操作）。
+func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.Resume(uid) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: resume uid=%s（恢复参与选号）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
@@ -444,20 +478,21 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
+	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	resp["credits"] = remain
 	resp["credits_total"] = total
 	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// accountBalance 单号余额刷新：UserResource → SetCredits（不触碰冷却状态）。
+// accountBalance 单号余额刷新：更新余额与到期快照，不触碰冷却状态。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -465,12 +500,12 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCredits(uid, remain, total)
+	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 
