@@ -592,10 +592,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .exp-main.err { color: var(--bad); }
 
 </style>
+<!-- 移动端适配：独立文件，必须在主 <style> 之后（@media 覆盖依赖层叠顺序） -->
+<link rel="stylesheet" href="mobile.css">
 </head>
 <body>
 <div class="shell">
-  <nav class="nav">
+  <nav class="nav" id="navDrawer">
     <div class="brand">
       <div class="name">WorkBuddy2API</div>
       <div class="sub" id="navSub">控制台</div>
@@ -631,6 +633,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
   <div class="main">
     <div class="topbar">
+      <!-- 汉堡按钮：桌面端由 .nav-btn{display:none} 隐藏，手机端才出现 -->
+      <button class="icon ghost nav-btn" id="navBtn" aria-label="打开导航" aria-controls="navDrawer" aria-expanded="false">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></svg>
+      </button>
       <h2 id="ttl">账号池</h2>
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
@@ -662,9 +668,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
+          <button class="xs" id="btnExpFold" aria-expanded="true">收起</button>
           <button class="xs" id="btnExp">检查</button>
         </header>
-        <div class="pad"><div id="expList"></div></div>
+        <div class="pad" id="expPad"><div id="expList"></div></div>
       </div>
 
       <div class="box">
@@ -1186,9 +1193,37 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </header>
         <pre id="logBox"></pre>
       </div>
+
+      <div class="box">
+        <header>
+          <h3>积分历史 <span class="hint">每次真实查到余额与上次比对，变动即留痕</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="creditNote">—</span>
+        </header>
+        <div class="fbar">
+          <select id="creditLimit" aria-label="读取条数">
+            <option value="100" selected>最近 100 条</option>
+            <option value="300">最近 300 条</option>
+            <option value="1000">最近 1000 条</option>
+          </select>
+          <span class="grow"></span>
+          <button class="xs" id="btnCreditReload">重新读取</button>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th>时间</th><th>账号</th><th class="num">变动</th><th class="num">变动后余额</th><th>说明</th>
+            </tr></thead>
+            <tbody id="creditBody"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
   </div>
 </div>
+
+<!-- 抽屉遮罩：仅 ≤760px 由 app.js 切 .on；桌面端 display:none，不参与布局 -->
+<div class="nav-veil" id="navVeil"></div>
 
 <!-- 积分任务 -->
 <div class="veil" id="taskVeil">
@@ -1311,5 +1346,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div id="toasts"></div>
 
 <script src="app.js"></script>
+<script src="mobile.js"></script>
 </body>
 </html>

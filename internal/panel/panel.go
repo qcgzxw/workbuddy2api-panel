@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/notify"
@@ -65,6 +66,9 @@ type Config struct {
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
 	RequestLog *reqlog.Recorder
+	// CreditHistory 积分变动账本（nil = 积分历史接口返回 501）。只读展示：
+	// 留痕由余额查询路径（upstream.Client 的余额观察者）写入。吸收上游 PR #138。
+	CreditHistory *credithist.Ledger
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -160,10 +164,13 @@ func (p *Panel) Logs() *Ring { return p.logs }
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	p.mux.HandleFunc("GET /panel/mobile.css", p.mobileStyle)
+	p.mux.HandleFunc("GET /panel/mobile.js", p.mobileScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
+	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
@@ -324,6 +331,67 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 		rows = []reqlog.Event{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows, "limit": limit})
+}
+
+// creditHistory 返回积分变动流水（新的在前），供「运行日志 → 积分历史」展示。
+// limit 默认 200、上限 1000（与 requestLogs 同口径）；可带 uid 精确过滤。
+// 账号昵称在读取时用池快照填充——账本只存 uid，上游改名后旧流水也跟着更新，
+// 且留痕路径不必碰 auth 的昵称锁。吸收上游 PR #138。
+func (p *Panel) creditHistory(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.CreditHistory == nil {
+		writeErr(w, http.StatusNotImplemented, "credit history not available")
+		return
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	uid := r.URL.Query().Get("uid")
+	nicks := p.nicknames()
+	// 有 uid 过滤时必须先全量取回（账本上限默认 2000 条）：先截断再过滤会让
+	// 筛选后的条数看起来像历史缺失。无过滤时只取 limit 条，不为一次展示拷贝整个账本。
+	readLimit := limit
+	if uid != "" {
+		readLimit = 0
+	}
+	all := p.cfg.CreditHistory.Read(readLimit)
+	out := make([]map[string]any, 0, limit)
+	for _, e := range all {
+		if uid != "" && e.UID != uid {
+			continue
+		}
+		out = append(out, map[string]any{
+			"time":    e.Time,
+			"uid":     e.UID,
+			"account": nicks[e.UID],
+			"delta":   e.Delta,
+			"before":  e.Before,
+			"after":   e.After,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": out, "limit": limit})
+}
+
+// nicknames 池内 uid → 昵称映射（仅展示用，不含任何凭证）。
+func (p *Panel) nicknames() map[string]string {
+	nicks := map[string]string{}
+	if p.cfg.Pool == nil {
+		return nicks
+	}
+	for _, s := range p.cfg.Pool.List() {
+		if s.Nickname != "" {
+			nicks[s.UID] = s.Nickname
+		}
+	}
+	return nicks
 }
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
@@ -531,8 +599,20 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	// 国际区账号无国内区签到体系：直接跳过、不发起任何上游调用（吸收 PR #104 part6）。
+	if a.IsGlobal() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"realm":        "global",
+			"skipped":      true,
+			"skip_reason":  "国际区账号不适用国内区签到",
+			"checkin_done": false,
+		})
+		return
+	}
 	checkinMsg := ""
 	checkinDone := false
+	checkinErr := ""
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
 	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
@@ -544,17 +624,23 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		if upstream.IsAlreadyCheckin(err) {
 			p.cfg.Pool.NoteCheckinDone(uid)
 			checkinDone = true
+		} else {
+			checkinErr = checkinMsg
 		}
 	} else {
 		p.cfg.Pool.NoteCheckinDone(uid)
 		checkinDone = true
 	}
-	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
+	// ok 与签到结果绑定：企业版本就不签到，故按「端点成功完成」记 ok。
+	resp := map[string]any{"ok": checkinDone || a.IsEnterprise(), "realm": "cn", "checkin_done": checkinDone}
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
 	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
+	}
+	if checkinErr != "" {
+		resp["checkin_error"] = checkinErr
 	}
 	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
 	if err != nil {
@@ -834,12 +920,7 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 昵称仅用于展示，取自池快照（不含任何凭证）。
-	nicks := map[string]string{}
-	for _, s := range p.cfg.Pool.List() {
-		if s.Nickname != "" {
-			nicks[s.UID] = s.Nickname
-		}
-	}
+	nicks := p.nicknames()
 	var currentRate func(realm, model string) string
 	if p.cfg.Upstream != nil {
 		currentRate = p.cfg.Upstream.ModelRate

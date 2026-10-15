@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-// TestAppJSSyntax app.js 必须能通过 JS 解析器语法校验。
+// TestAppJSSyntax app.js / mobile.js 必须能通过 JS 解析器语法校验。
 //
-// 为什么需要：app.js 是 go:embed 进二进制的静态资源，Go 编译器不检查其内容——
+// 为什么需要：两者都是 go:embed 进二进制的静态资源，Go 编译器不检查其内容——
 // 一次对象字面量键名未加引号（Model_chat_GLM5.2 被解析成属性访问 + 数字字面量）
 // 就让整个面板白屏，而所有 Go 测试依然全绿。此测试把语法校验前移到 CI。
 // 无 node 环境时跳过（不阻塞无 Node 的构建机）。
@@ -24,13 +24,15 @@ func TestAppJSSyntax(t *testing.T) {
 	if err != nil {
 		t.Skip("node not available; skipping JS syntax check")
 	}
-	path, err := filepath.Abs("app.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := exec.Command(node, "--check", path).CombinedOutput()
-	if err != nil {
-		t.Fatalf("app.js syntax error:\n%s", out)
+	for _, name := range []string{"app.js", "mobile.js"} {
+		path, err := filepath.Abs(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command(node, "--check", path).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s syntax error:\n%s", name, out)
+		}
 	}
 }
 
@@ -128,6 +130,9 @@ const sandbox = new Proxy({
   fetch: () => new Promise(() => {}),
   addEventListener() {}, removeEventListener() {},
   matchMedia: () => ({ matches: false, addEventListener() {} }),
+  // mobile.js 顶层直接 new MutationObserver(...)（移动端表格字段名补标签）：
+  // 该文件不在本沙箱内执行，但保留此桩，将来把 mobile.js 纳入冒烟时可直接复用。
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
   setInterval, clearInterval, setTimeout, clearTimeout,
   getComputedStyle: () => inert,
   confirm: () => false, prompt: () => null, alert() {},
@@ -226,6 +231,9 @@ const sandbox = new Proxy({
   fetch: () => new Promise(() => {}),
   addEventListener() {}, removeEventListener() {},
   matchMedia: () => ({ matches: false, addEventListener() {} }),
+  // mobile.js 顶层直接 new MutationObserver(...)（移动端表格字段名补标签）：
+  // 该文件不在本沙箱内执行，但保留此桩，将来把 mobile.js 纳入冒烟时可直接复用。
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
   setInterval, clearInterval, setTimeout, clearTimeout,
   getComputedStyle: () => inert, confirm: () => false, prompt: () => null, alert() {},
   console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, WeakMap, WeakSet,
@@ -633,6 +641,53 @@ process.stdout.write(JSON.stringify({
 	want := `{"good":` + strconv.Quote(text) + `,"noSource":` + strconv.Quote(noSource) + `,"cached":` + strconv.Quote(cached) + `}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request log formatting=%s want %s", out, want)
+	}
+}
+
+// 积分历史区块：变动列 +N / −N（U+2212）、余额千分位、空列表提示。
+func TestAppJSCreditHistoryFormatting(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; credit history formatting test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function creditNum');
+const end = src.indexOf('function renderCreditHistory');
+if (start < 0 || end < 0) throw new Error('credit history helpers not found');
+const ctx = { Date, Number, String, Math, RegExp, isNaN };
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(start, end) +
+  '\nthis.creditEntryText=creditEntryText;this.creditHistoryNote=creditHistoryNote;',
+  ctx
+);
+const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
+process.stdout.write(JSON.stringify({
+  gain: ctx.creditEntryText({ time, uid: '89374120', account: '小明', delta: 100, before: 1300, after: 1400 }),
+  loss: ctx.creditEntryText({ time, uid: '89374120', account: '', delta: -30, before: 1400, after: 1370 }),
+  note: ctx.creditHistoryNote([{ delta: 1300 }, { delta: -60 }]),
+  empty: ctx.creditHistoryNote([]),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "credit-history-format-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("credit history formatting node test failed: %v\n%s", err, out)
+	}
+	gain := "14:05:06 | 小明 | +100 | 1,400 | 余额 1,300 → 1,400"
+	loss := "14:05:06 | 89374120 | −30 | 1,370 | 余额 1,400 → 1,370"
+	want := `{"gain":` + strconv.Quote(gain) + `,"loss":` + strconv.Quote(loss) +
+		`,"note":"2 条 · 净 +1,240","empty":"暂无积分变动记录"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("credit history formatting=%s want %s", out, want)
 	}
 }
 
@@ -1262,5 +1317,163 @@ process.stdout.write(JSON.stringify({
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
 			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestMobileJSChartTooltipInsideBar 手机端自绘图表的 tooltip 同样要挂在柱子内部（issue #128）。
+//
+// mobile.js 在窄屏另画一张图（440×230），不走 app.js 的 renderUsageChart：上游修好
+// 桌面实现不会覆盖它。断言与 TestAppJSChartTooltipInsideBar 同构，只取文件里
+// 「接管 renderUsageChart」之后的部分，DOM/全局用桩喂进去。吸收上游 PR #143。
+func TestMobileJSChartTooltipInsideBar(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; mobile chart tooltip test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const deskUsageChart');
+if (start < 0) throw new Error('mobile chart override not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '' });
+const ctx = {
+  MOBILE_MQ: { matches: true },
+  renderUsageChart: () => {},
+  esc: s => String(s == null ? '' : s),
+  fmtTok: v => String(v == null ? 0 : v),
+  fmtTokTimeLabel: p => { const d = new Date(p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00');
+                          return p.scope === 'day' ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
+                                                   : String(d.getHours()).padStart(2, '0') + ':00'; },
+  parsePointTime: p => { const d = new Date(p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00');
+                         return isNaN(d.getTime()) ? null : d.getTime(); },
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Map, Array, Object, isNaN, Infinity, isFinite, Set,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start) + '\nthis.renderUsageChart = renderUsageChart;', ctx);
+const series = [];
+for (let h = 0; h < 5; h++) {
+  const d = new Date(); d.setHours(d.getHours() - (4 - h), 0, 0, 0);
+  const iso = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' +
+              String(d.getDate()).padStart(2, '0') + 'T' + String(d.getHours()).padStart(2, '0');
+  series.push({ t: iso, scope: 'hour', prompt_tokens: (h + 1) * 100,
+                completion_tokens: (h + 1) * 10, total_tokens: (h + 1) * 110, requests: h + 1 });
+}
+ctx.renderUsageChart(series);
+const svg = sinks['usChart'] ? sinks['usChart'].innerHTML : '';
+const groups = svg.match(/<g><title>/g) || [];
+const titles = svg.match(/<title>[^<]*<\/title>/g) || [];
+const loose = (svg.match(/(?:<rect[^>]*\/>|<\/g>)<title>/g) || []).length;
+process.stdout.write(JSON.stringify({
+  points: series.length, groups: groups.length, titles: titles.length, loose: loose,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "mobilecharttip-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "mobile.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("mobile chart tooltip node test failed: %v\n%s", err, out)
+	}
+	const want = `{"points":5,"groups":5,"titles":5,"loose":0}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("mobile chart tooltip structure=%s\nwant %s（groups 应等于数据点数，loose 应为 0）",
+			strings.TrimSpace(string(out)), want)
+	}
+}
+
+// 「积分到期提醒」折叠：默认展开（点「检查」就得能看到结果），用户收起一次后由
+// localStorage 记住、重载时恢复；折叠只切列表容器的 hidden，不影响卡片与「检查」。
+// 吸收上游 PR #178（仅折叠部分）。
+func TestAppJSExpiryFold(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry fold test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expFolded(');
+const endMarker = 'applyExpFold();';
+const end = src.lastIndexOf(endMarker);
+if (start < 0 || end < 0) throw new Error('expiry fold helpers not found');
+const slice = src.slice(start, end + endMarker.length);
+function boot(stored) {
+  const ctx = {};
+  vm.createContext(ctx);
+  vm.runInContext(
+    "const LS_EXP_FOLD='wb2api.expfold.v1';" +
+    "const store=" + JSON.stringify(stored) + ";" +
+    "const pad={hidden:false};" +
+    "const btn={textContent:'',attrs:{},setAttribute:function(k,v){this.attrs[k]=v;}};" +
+    "function $(id){return id==='expPad'?pad:(id==='btnExpFold'?btn:null);}" +
+    "const localStorage={getItem:function(k){return (k in store)?store[k]:null;},setItem:function(k,v){store[k]=v;}};" +
+    slice +
+    "\nthis.state=function(){return {hidden:pad.hidden,text:btn.textContent,aria:btn.attrs['aria-expanded'],raw:store['wb2api.expfold.v1']||null};};" +
+    "\nthis.click=function(){btn.onclick();};",
+    ctx
+  );
+  return ctx;
+}
+const a = boot({});
+const fresh = a.state();
+a.click();
+const folded = a.state();
+a.click();
+const unfolded = a.state();
+const restored = boot({'wb2api.expfold.v1': '1'}).state();
+process.stdout.write(JSON.stringify({fresh: fresh, folded: folded, unfolded: unfolded, restored: restored}));`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-fold-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry fold node test failed: %v\n%s", err, out)
+	}
+	const want = `{"fresh":{"hidden":false,"text":"收起","aria":"true","raw":null},"folded":{"hidden":true,"text":"展开","aria":"false","raw":"1"},"unfolded":{"hidden":false,"text":"收起","aria":"true","raw":"0"},"restored":{"hidden":true,"text":"展开","aria":"false","raw":"1"}}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("expiry fold=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// 折叠接线齐备性：少一个 id 或漏一个 localStorage 键，表现为「按钮点了没反应」，
+// 而 Go 编译、JS 语法检查、顶层冒烟都发现不了（脚本能正常跑，只是挂不上）。
+func TestPanelExpiryFoldWiring(t *testing.T) {
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`id="expPad"`, `id="btnExpFold"`} {
+		if !bytes.Contains(html, []byte(want)) {
+			t.Fatalf("index.html 缺少 %s", want)
+		}
+	}
+	// 折叠容器默认必须可见：列表一旦带上 hidden，点「检查」就看不到结果了。
+	for _, line := range strings.Split(string(html), "\n") {
+		if strings.Contains(line, `id="expPad"`) && strings.Contains(line, "hidden") {
+			t.Fatalf("index.html 的过期列表容器默认带 hidden：%s", strings.TrimSpace(line))
+		}
+	}
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"LS_EXP_FOLD = 'wb2api.expfold.v1'",
+		"function applyExpFold(",
+	} {
+		if !bytes.Contains(js, []byte(want)) {
+			t.Fatalf("app.js 缺少 %s", want)
+		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -1023,6 +1024,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			credit, hasCredit := stats.Credit()
+			// 计费门禁（吸收 PR #104 part3）：须同时拿到可信的 credit 与正整数 total
+			// 才认这次 usage 有效——坏帧（负/NaN/小数 total、缺失或非法 credit）不得被
+			// 当成「确认免费」或归档旧费用。
+			total, hasTotal := stats.TotalTokens()
+			hasCredit = validUsageCost(credit, hasCredit, total, hasTotal)
 			if hit, miss, ok := stats.CacheTokens(); ok {
 				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
 			}
@@ -1052,12 +1058,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// metrics 采集（流式）：token 三段 + 缓存三段 + 真实扣费（供 /v1/stats）。
 			// 与成本账本同源同口径（都读末帧 usage），故此处一并带出，避免二次解析。
 			fillStatFromReader(st, stats)
-			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
+			// 与成本账本同门禁：usage 未通过 validUsageCost 时 st 不得留着 credit
+			// （否则 /v1/stats 显示扣费、请求记录却不认，口径打架）。
+			if !hasCredit {
+				st.hasCredit = false
+				st.credit = 0
+			}
+			// 成本账本：末帧 usage 带可信 credit 与正整数 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if hasCredit {
-				if total, tok := stats.TotalTokens(); tok && total > 0 {
-					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
-				}
+				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 			}
 			rc.Close()
 			return
@@ -1258,18 +1268,47 @@ func promptTooLongMessage(body string) string {
 }
 
 // usageCreditTotal 从聚合响应取 usage.credit 与 total_tokens（成本台账非流式入口）。
-// 任一字段缺失/非法 → ok=false（不记录）。
+// 任一字段缺失/非法 → ok=false（不记录）。吸收 PR #104 part3：显式的 credit=0 是
+// 「确认免费」的合法观测；total_tokens 必须是正整数（拒绝小数/Inf/超 int 范围）。
 func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
 	usage, _ := resp["usage"].(map[string]any)
 	if usage == nil {
 		return 0, 0, false
 	}
-	c, _ := usage["credit"].(float64)
-	t, _ := usage["total_tokens"].(float64)
-	if t <= 0 {
+	c, hasCredit := usage["credit"].(float64)
+	t, hasTotal := usage["total_tokens"].(float64)
+	parsedTotal, validTotal := parseUsageTotalTokens(t)
+	if !validTotal {
 		return 0, 0, false
 	}
-	return c, int(t), true
+	if !validUsageCost(c, hasCredit, parsedTotal, hasTotal) {
+		return 0, 0, false
+	}
+	return c, parsedTotal, true
+}
+
+// validUsageCredit accepts only an explicitly present, finite, non-negative
+// upstream credit value. Zero is valid and represents a confirmed free request.
+func validUsageCredit(credit float64, present bool) bool {
+	return present && !math.IsNaN(credit) && !math.IsInf(credit, 0) && credit >= 0
+}
+
+// parseUsageTotalTokens accepts a finite positive integer that fits the
+// platform int used by the cost ledger.
+func parseUsageTotalTokens(total float64) (int, bool) {
+	if math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 || math.Trunc(total) != total {
+		return 0, false
+	}
+	parsed := int(total)
+	if parsed <= 0 || float64(parsed) != total {
+		return 0, false
+	}
+	return parsed, true
+}
+
+// validUsageCost applies the shared billing gate for stream and aggregate usage.
+func validUsageCost(credit float64, hasCredit bool, total int, hasTotal bool) bool {
+	return validUsageCredit(credit, hasCredit) && hasTotal && total > 0
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：第 i 次轮转失败
