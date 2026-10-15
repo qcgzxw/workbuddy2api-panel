@@ -1,6 +1,8 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+/* 「积分到期提醒」折叠的本机键（模块级声明放顶部，避开 TDZ）。吸收上游 PR #178。 */
+const LS_EXP_FOLD = 'wb2api.expfold.v1';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
@@ -3217,3 +3219,24 @@ if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
 // 「刷新」始终实时查（显式 force，不依赖事件对象真值）
 if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
+
+/* ══ 首页「积分到期提醒」折叠（选择记在本机，默认展开）═════════════════════
+   展开态是原行为：点「检查」就要能立刻看到结果，所以默认不折叠；用户收起一次后
+   由 localStorage 记住。折叠只作用于列表容器，卡片标题与「检查」按钮始终可见。
+   吸收上游 PR #178（仅折叠部分；账号备注本仓库已有服务端实现，未采纳）。 */
+function expFolded() { return localStorage.getItem(LS_EXP_FOLD) === '1'; }
+function applyExpFold() {
+  const pad = $('expPad'), btn = $('btnExpFold');
+  if (!pad || !btn) return;
+  const folded = expFolded();
+  pad.hidden = folded;
+  btn.textContent = folded ? '展开' : '收起';
+  btn.setAttribute('aria-expanded', folded ? 'false' : 'true');
+}
+if ($('btnExpFold')) {
+  $('btnExpFold').onclick = () => {
+    try { localStorage.setItem(LS_EXP_FOLD, expFolded() ? '0' : '1'); } catch (e) {}
+    applyExpFold();
+  };
+}
+applyExpFold();

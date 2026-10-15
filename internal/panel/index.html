@@ -668,9 +668,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>积分到期提醒<span class="hint">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
+          <button class="xs" id="btnExpFold" aria-expanded="true">收起</button>
           <button class="xs" id="btnExp">检查</button>
         </header>
-        <div class="pad"><div id="expList"></div></div>
+        <div class="pad" id="expPad"><div id="expList"></div></div>
       </div>
 
       <div class="box">
