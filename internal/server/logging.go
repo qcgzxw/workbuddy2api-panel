@@ -178,10 +178,10 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	var chunk struct {
 		Error json.RawMessage `json:"error"`
 		Usage *struct {
-			PromptTokens     *int     `json:"prompt_tokens"`
-			CompletionTokens *int     `json:"completion_tokens"`
-			TotalTokens      *int     `json:"total_tokens"`
-			Credit           *float64 `json:"credit"`
+			PromptTokens     *int            `json:"prompt_tokens"`
+			CompletionTokens *int            `json:"completion_tokens"`
+			TotalTokens      json.RawMessage `json:"total_tokens"`
+			Credit           json.RawMessage `json:"credit"`
 			// 缓存三段（上游实测字段名，见 /v1/stats 的 cache_* 口径）。
 			PromptCacheHitTokens   *int `json:"prompt_cache_hit_tokens"`
 			PromptCacheMissTokens  *int `json:"prompt_cache_miss_tokens"`
@@ -205,9 +205,21 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasCompletionTokens = true
 		s.completionTokens = *chunk.Usage.CompletionTokens
 	}
-	if chunk.Usage.TotalTokens != nil {
-		s.hasTotalTokens = true
-		s.totalTokens = *chunk.Usage.TotalTokens
+	if len(chunk.Usage.TotalTokens) > 0 {
+		var total float64
+		if json.Unmarshal(chunk.Usage.TotalTokens, &total) == nil {
+			parsedTotal, valid := parseUsageTotalTokens(total)
+			if !valid {
+				s.hasTotalTokens = false
+				s.totalTokens = 0
+			} else {
+				s.hasTotalTokens = true
+				s.totalTokens = parsedTotal
+			}
+		} else {
+			s.hasTotalTokens = false
+			s.totalTokens = 0
+		}
 	}
 	if chunk.Usage.PromptCacheHitTokens != nil {
 		s.hasCacheHit = true
@@ -220,9 +232,17 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if chunk.Usage.PromptCacheWriteTokens != nil {
 		s.cacheWr = *chunk.Usage.PromptCacheWriteTokens
 	}
-	if chunk.Usage.Credit != nil {
-		s.hasCredit = true
-		s.credit = *chunk.Usage.Credit
+	if len(chunk.Usage.Credit) > 0 {
+		var credit float64
+		if json.Unmarshal(chunk.Usage.Credit, &credit) == nil && validUsageCredit(credit, true) {
+			s.hasCredit = true
+			s.credit = credit
+		} else {
+			// An invalid later usage frame supersedes an earlier value; do not
+			// archive the previous frame's fee as if it belonged to this response.
+			s.hasCredit = false
+			s.credit = 0
+		}
 	}
 }
 
