@@ -599,8 +599,20 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	// 国际区账号无国内区签到体系：直接跳过、不发起任何上游调用（吸收 PR #104 part6）。
+	if a.IsGlobal() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":           true,
+			"realm":        "global",
+			"skipped":      true,
+			"skip_reason":  "国际区账号不适用国内区签到",
+			"checkin_done": false,
+		})
+		return
+	}
 	checkinMsg := ""
 	checkinDone := false
+	checkinErr := ""
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
 	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
@@ -612,17 +624,23 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		if upstream.IsAlreadyCheckin(err) {
 			p.cfg.Pool.NoteCheckinDone(uid)
 			checkinDone = true
+		} else {
+			checkinErr = checkinMsg
 		}
 	} else {
 		p.cfg.Pool.NoteCheckinDone(uid)
 		checkinDone = true
 	}
-	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
+	// ok 与签到结果绑定：企业版本就不签到，故按「端点成功完成」记 ok。
+	resp := map[string]any{"ok": checkinDone || a.IsEnterprise(), "realm": "cn", "checkin_done": checkinDone}
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
 	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
+	}
+	if checkinErr != "" {
+		resp["checkin_error"] = checkinErr
 	}
 	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
 	if err != nil {
